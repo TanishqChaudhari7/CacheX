@@ -10,7 +10,11 @@ compile_commands.json
 
 # Editors / IDEs / local tooling
 .claude/settings.local.json
-.vscode/
+
+# Personal editor settings stay out, but the C++ configuration is shared: it is
+# what makes IntelliSense agree with the build about the language standard.
+.vscode/*
+!.vscode/c_cpp_properties.json
 .idea/
 *.swp
 *~

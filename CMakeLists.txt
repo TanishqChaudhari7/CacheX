@@ -19,6 +19,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Emit compile_commands.json so clangd / clang-tidy work without extra setup.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ...and link it into the source root, which is where clangd and most editor
+# extensions look. Without this the editor has no idea the project is C++17, so
+# every std::optional shows up as an error even though the build is clean.
+# Whichever build directory configured last wins, which is what you want: it is
+# the one you are working in.
+if(CMAKE_EXPORT_COMPILE_COMMANDS AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
+  file(CREATE_LINK
+    "${CMAKE_BINARY_DIR}/compile_commands.json"
+    "${CMAKE_SOURCE_DIR}/compile_commands.json"
+    SYMBOLIC)
+endif()
+
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
