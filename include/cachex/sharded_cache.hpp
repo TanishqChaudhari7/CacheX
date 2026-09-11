@@ -78,6 +78,15 @@ class ShardedCache {
   std::size_t evictions() const;
   std::size_t expired_removals() const;
 
+  /// Every live entry across every shard.
+  ///
+  /// Shards are locked **one at a time**, so this is internally consistent per
+  /// shard but not a single point-in-time view of the whole cache: shard 0 is
+  /// read slightly before shard N-1. Locking all shards at once would give a
+  /// true snapshot and would reintroduce exactly the global stall sharding
+  /// exists to remove. See ARCHITECTURE §9.4 and §10.4.
+  std::vector<EntrySnapshot> export_entries() const;
+
   // --- shard introspection (diagnostics and tests) --------------------------
 
   std::size_t shard_count() const noexcept { return shards_.size(); }

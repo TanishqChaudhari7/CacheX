@@ -15,6 +15,7 @@ find_package(Threads REQUIRED)
 add_library(cachex_core
   cache.cpp
   sharded_cache.cpp
+  persistence.cpp
   recency_list.cpp
   version.cpp)
 

@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "cachex/persistence.hpp"
 #include "cachex/sharded_cache.hpp"
 #include "cachex/socket.hpp"
 
@@ -44,7 +45,10 @@ class Server {
     bool verbose = true;
   };
 
-  Server(ShardedCache& cache, Options options);
+  /// `persistence` may be null; SAVE and LOAD then report that persistence is
+  /// not enabled. The Server does not own it and does not outlive it.
+  Server(ShardedCache& cache, Options options,
+         PersistenceManager* persistence = nullptr);
 
   /// socket() + bind() + listen(). Returns false on failure with `error` set.
   /// Separate from run() so that a caller -- notably a test -- can learn the
@@ -88,6 +92,7 @@ class Server {
   void join_all_workers();
 
   ShardedCache& cache_;
+  PersistenceManager* persistence_ = nullptr;
   Options options_;
   Socket listener_;
   std::uint16_t bound_port_ = 0;

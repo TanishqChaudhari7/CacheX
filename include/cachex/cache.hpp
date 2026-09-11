@@ -30,6 +30,21 @@ struct TtlInfo {
   std::chrono::milliseconds remaining{0};
 };
 
+/// One entry as an outside observer sees it: no iterators, no deadlines tied to
+/// this process, nothing private.
+///
+/// The TTL is a *remaining duration*, not the absolute deadline the entry stores
+/// internally. That is forced by the clock choice: steady_clock's epoch is
+/// unspecified (in practice, boot time), so a deadline from one process is
+/// meaningless in the next one. Converting to "time left" at export is the price
+/// of using a monotonic clock, and it was flagged as future work back in §6.2.
+struct EntrySnapshot {
+  std::string key;
+  std::string value;
+  /// nullopt means the entry never expires.
+  std::optional<std::chrono::milliseconds> remaining_ttl;
+};
+
 /// A single-threaded in-memory key-value cache with optional LRU eviction.
 ///
 /// Two structures cooperate:
@@ -124,6 +139,13 @@ class Cache {
   /// Entries removed because they were found expired, cumulative over the
   /// cache's lifetime. Like evictions(), not reset by clear().
   std::size_t expired_removals() const noexcept { return expired_removals_; }
+
+  /// Every live entry, most recently used first.
+  ///
+  /// Expired entries are skipped rather than reclaimed -- this is const, like
+  /// contains(). O(n), and it copies everything, so it is for persistence and
+  /// diagnostics, not for the request path.
+  std::vector<EntrySnapshot> export_entries() const;
 
   /// Keys from most to least recently used -- so `.back()` is the next victim.
   /// Includes expired entries that have not been reclaimed yet.

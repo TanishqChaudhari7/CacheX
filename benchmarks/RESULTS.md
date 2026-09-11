@@ -6,13 +6,82 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §12](../ARCHITECTURE.md#12-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
 ./build/release/bin/cachex_bench
 ```
+
+---
+
+## Stage 8 — persistence
+
+`cachex_persist_bench`, Release, 16-byte keys / 64-byte values, 8 shards, median
+of 5 runs, on this machine's `/tmp`.
+
+### Entries without a TTL
+
+| entries | save | load | save µs/entry | snapshot | bytes/entry |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.75 ms | 0.52 ms | 0.751 | 87.9 KiB | 90.0 |
+| 10,000 | 4.55 ms | 4.67 ms | 0.455 | 878.9 KiB | 90.0 |
+| 100,000 | 50.54 ms | 48.51 ms | 0.505 | 8.6 MiB | 90.0 |
+| 500,000 | 264.00 ms | 252.25 ms | 0.528 | 42.9 MiB | 90.0 |
+
+### Entries with a TTL
+
+| entries | save | load | snapshot | bytes/entry |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.66 ms | 0.59 ms | 92.8 KiB | 95.0 |
+| 10,000 | 4.41 ms | 5.74 ms | 927.8 KiB | 95.0 |
+| 100,000 | 53.30 ms | 57.00 ms | 9.1 MiB | 95.0 |
+| 500,000 | 302.23 ms | 294.02 ms | 45.3 MiB | 95.0 |
+
+A TTL costs **5 bytes per entry** — the millisecond count in place of `-1`.
+
+### Reading these
+
+**Save and load both scale linearly**, at roughly **0.5 µs per entry** each way.
+That is what a single pass over the data should look like: the save walks every
+entry once and writes it; the load parses every record once and calls `set()`.
+There is no index to rebuild on disk and none to sort on the way in.
+
+Load is consistently a little *faster* than save at the same size despite doing
+more work per record (parsing, then a hash insert and an LRU splice). The likely
+reason is the page cache — the file was just written, so the read never touches
+the device. A cold-cache load would be slower, and this benchmark does not
+measure that.
+
+### Snapshot size against memory
+
+| | bytes/entry | vs payload |
+| --- | ---: | ---: |
+| Payload (key + value) | 80 | 1.00x |
+| Snapshot on disk | 90 | 1.13x |
+| Live cache in memory | ~180–200 (estimated) | ~2.4x |
+
+The snapshot is **roughly half the size of the live cache**. It stores only the
+data; the hash map's buckets and nodes, both list pointers, the duplicated key
+and the allocator's overhead exist to make lookups O(1), and none of that is
+worth writing down because loading rebuilds it.
+
+The 10 bytes of snapshot overhead per entry are the length header
+(`<key_len> <value_len> <ttl_ms>\n`) plus the trailing newline. The in-memory
+figure is an estimate from the data layout, **not a measurement** — measuring it
+properly is still open.
+
+### The number with an operational consequence
+
+**A synchronous `SAVE` of 500,000 entries blocks the connection that issued it
+for ~264 ms.** Other clients are unaffected: `save()` copies the cache out under
+per-shard locks and then writes with no lock held, so the disk never stalls the
+request path. But the client that asked waits for the whole write.
+
+That is the argument for `BGSAVE` (fork, let the child write a copy-on-write
+snapshot) at a size where 264 ms matters — and the reason it is not here is that
+it is a great deal more machinery than this stage calls for.
 
 ---
 

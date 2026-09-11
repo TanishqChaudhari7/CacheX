@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <utility>
 
 namespace cachex {
@@ -112,6 +113,18 @@ std::optional<std::size_t> ShardedCache::capacity() const {
     total += shard->capacity().value_or(0);
   }
   return total;
+}
+
+std::vector<EntrySnapshot> ShardedCache::export_entries() const {
+  std::vector<EntrySnapshot> all;
+  for (const std::unique_ptr<SyncCache>& shard : shards_) {
+    // One shard locked at a time. Each shard's slice is consistent; the whole is
+    // not a single instant, which is the documented trade.
+    std::vector<EntrySnapshot> part = shard->export_entries();
+    all.insert(all.end(), std::make_move_iterator(part.begin()),
+               std::make_move_iterator(part.end()));
+  }
+  return all;
 }
 
 std::size_t ShardedCache::evictions() const {

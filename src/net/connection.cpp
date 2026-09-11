@@ -18,8 +18,9 @@ constexpr std::size_t kReadChunkBytes = 16 * 1024;
 
 }  // namespace
 
-Connection::Connection(Socket socket, ShardedCache& cache)
-    : socket_(std::move(socket)), cache_(cache) {}
+Connection::Connection(Socket socket, ShardedCache& cache,
+                       PersistenceManager* persistence)
+    : socket_(std::move(socket)), cache_(cache), persistence_(persistence) {}
 
 bool Connection::fill_buffer() {
   char chunk[kReadChunkBytes];
@@ -53,7 +54,7 @@ bool Connection::handle_line(const std::string& line) {
   }
 
   ++commands_handled_;
-  const std::string reply = execute(cache_, parsed.command);
+  const std::string reply = execute(cache_, parsed.command, persistence_);
   if (!send_all(socket_.get(), reply)) {
     return false;  // the peer went away mid-write
   }

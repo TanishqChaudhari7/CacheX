@@ -104,6 +104,11 @@ class SyncCache {
     return cache_.expired_removals();
   }
 
+  std::vector<EntrySnapshot> export_entries() const {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return cache_.export_entries();
+  }
+
   std::vector<std::string> keys_by_recency() const {
     const std::lock_guard<std::mutex> lock(mutex_);
     return cache_.keys_by_recency();

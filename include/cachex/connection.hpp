@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cachex/persistence.hpp"
 #include "cachex/sharded_cache.hpp"
 #include "cachex/line_buffer.hpp"
 #include "cachex/socket.hpp"
@@ -14,7 +15,8 @@ namespace cachex {
 /// assuming one read equals one request.
 class Connection {
  public:
-  Connection(Socket socket, ShardedCache& cache);
+  Connection(Socket socket, ShardedCache& cache,
+             PersistenceManager* persistence = nullptr);
 
   /// Reads commands and writes replies until the client disconnects, sends
   /// QUIT, or breaks the protocol. Blocking; returns when the connection is
@@ -34,6 +36,7 @@ class Connection {
 
   Socket socket_;
   ShardedCache& cache_;
+  PersistenceManager* persistence_ = nullptr;
   LineBuffer buffer_;
   std::size_t commands_handled_ = 0;
 };

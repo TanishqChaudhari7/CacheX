@@ -10,7 +10,7 @@ namespace {
 /// The short-circuit matters: an entry with no deadline never reads the clock.
 /// steady_clock::now() costs roughly as much as the hash lookup itself, so
 /// checking `has_value()` first is what keeps TTL close to free for the keys
-/// that do not use it. Benchmarked in ARCHITECTURE.md §12.
+/// that do not use it. Benchmarked in ARCHITECTURE.md §13.
 bool is_expired(const Entry& entry) {
   return entry.expires_at.has_value() && *entry.expires_at <= Entry::Clock::now();
 }
@@ -161,6 +161,31 @@ bool Cache::contains(const std::string& key) const {
 void Cache::clear() noexcept {
   index_.clear();
   entries_.clear();
+}
+
+std::vector<EntrySnapshot> Cache::export_entries() const {
+  std::vector<EntrySnapshot> out;
+  out.reserve(index_.size());
+
+  // Sampled once so every entry is measured against the same instant; reading
+  // the clock per entry would make a long export drift.
+  const Clock::time_point now = Clock::now();
+
+  // Front to back, so the result is most-recently-used first. The loader replays
+  // it in reverse, which reconstructs the same recency order in the new process.
+  for (const Entry& entry : entries_) {
+    if (!entry.expires_at.has_value()) {
+      out.push_back(EntrySnapshot{entry.key, entry.value, std::nullopt});
+      continue;
+    }
+    if (*entry.expires_at <= now) {
+      continue;  // already expired: not worth writing out
+    }
+    out.push_back(EntrySnapshot{
+        entry.key, entry.value,
+        std::chrono::duration_cast<Duration>(*entry.expires_at - now)});
+  }
+  return out;
 }
 
 std::vector<std::string> Cache::keys_by_recency() const {

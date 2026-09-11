@@ -23,8 +23,9 @@ constexpr int kAcceptPollMs = 100;
 
 }  // namespace
 
-Server::Server(ShardedCache& cache, Options options)
-    : cache_(cache), options_(std::move(options)) {}
+Server::Server(ShardedCache& cache, Options options,
+               PersistenceManager* persistence)
+    : cache_(cache), persistence_(persistence), options_(std::move(options)) {}
 
 bool Server::start(std::string& error) {
   // 1. socket() -- create an endpoint. It is not yet attached to any address.
@@ -152,7 +153,7 @@ void Server::spawn_worker(Socket client) {
   }
 
   std::thread worker([this, socket = std::move(client), finished, id]() mutable {
-    Connection connection(std::move(socket), cache_);
+    Connection connection(std::move(socket), cache_, persistence_);
     connection.serve();
 
     if (options_.verbose) {

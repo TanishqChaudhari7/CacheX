@@ -49,7 +49,24 @@ Tokens are separated by spaces or tabs; runs of separators collapse, so
 | `EXISTS key` | 1 | `:1` or `:0` |
 | `TTL key` | 1 | `:seconds`, `+NOEXPIRE`, or `_` |
 | `PING` | 0 | `+PONG` |
+| `SAVE` | 0 | `:entries_written`, or `-ERR ...` |
+| `LOAD` | 0 | `:entries_loaded`, or `-ERR ...` |
 | `QUIT` | 0 | `+BYE`, then the server closes the connection |
+
+### SAVE and LOAD
+
+Administrative commands, available only when the server was started with a
+snapshot path. Without one they reply
+`-ERR persistence is not enabled on this server`.
+
+**They take no arguments on purpose.** The path is server configuration, never
+something a client supplies — accepting one over the network would let any client
+read or overwrite an arbitrary file the server process can reach.
+
+- `SAVE` writes every live entry to the configured file and replies with the count. It is synchronous: the connection that asked waits for the write (~264 ms for 500,000 entries). Other clients are not blocked.
+- `LOAD` reads that file back, adding its entries to the cache via ordinary `SET` semantics. Entries whose TTL ran out while the file sat on disk are skipped. A malformed file is rejected and the cache is left untouched.
+
+Neither command clears the cache first.
 
 ### ⚠️ Keys and values cannot contain whitespace or newlines
 
@@ -195,6 +212,7 @@ QUIT
 - Length-prefixed framing (so keys/values could hold arbitrary bytes)
 - Pipelining guarantees — the server *does* handle multiple buffered commands per read, but the protocol makes no promise about it
 - `EXPIRE` / `PERSIST` (changing a TTL without rewriting the value)
+- `BGSAVE` (snapshotting in a forked child instead of blocking the caller)
 - `KEYS`, `SCAN`, `FLUSH`, `INFO`, `DBSIZE`
 - Authentication and TLS — CacheX assumes a trusted local network
 - Any binary encoding

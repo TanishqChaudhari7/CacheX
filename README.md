@@ -14,16 +14,18 @@ it, and the full roadmap.
 
 ## Status
 
-**Stage 7 of 11 — sharded cache.**
+**Stage 8 of 11 — snapshot persistence.**
 
-The cache is split into N independently locked shards, so threads working on keys
-in different shards never wait for each other. `ShardedCache` exposes the same API
-as before, so the network layer never learns sharding exists. 186 tests pass,
-including under AddressSanitizer, UndefinedBehaviorSanitizer and
-**ThreadSanitizer**, with zero leaks.
+The cache can now survive a restart. `SAVE` writes every live entry to a snapshot
+file, the server reloads it on startup, and an optional background thread saves on
+an interval. TTLs are preserved as remaining time; entries that expired while the
+file sat on disk are not restored. 205 tests pass, including under
+AddressSanitizer, UndefinedBehaviorSanitizer and **ThreadSanitizer**, with zero
+leaks.
 
-**Measured: +232% throughput at 4 threads in-process — and ≤0.8% over TCP.**
-Both numbers matter; see [the results](#sharding-results) below.
+⚠️ **This is a snapshot, not a database.** `fsync` is never called and there is no
+write-ahead log, so everything written since the last save is lost on a crash.
+[What it does not provide](ARCHITECTURE.md#107-what-this-is-not).
 
 | | |
 | --- | --- |
@@ -33,9 +35,10 @@ Both numbers matter; see [the results](#sharding-results) below.
 | ✅ Stage 4 | Per-key TTL, lazy expiration, measured TTL cost |
 | ✅ Stage 5 | TCP server, line protocol, CLI client, network benchmark |
 | ✅ Stage 6 | Thread-per-connection, `SyncCache`, TSan clean, scaling benchmark |
-| ✅ Stage 7 | Sharded cache, 186 tests, A/B/C/D × 1–16 client benchmark matrix |
-| ⬜ Next | Stage 8 — benchmark harness II (sub-tick latency) |
-| ⬜ Later | active expiry · persistence · event loop · optimisation |
+| ✅ Stage 7 | Sharded cache, A/B/C/D × 1–16 client benchmark matrix |
+| ✅ Stage 8 | Snapshot persistence, `SAVE`/`LOAD`, 205 tests |
+| ⬜ Next | Stage 9 — benchmark harness II (sub-tick latency) |
+| ⬜ Later | active expiry · event loop · optimisation |
 
 ## Try it
 
@@ -181,6 +184,8 @@ character.
 | `EXISTS key` | `:1` or `:0` |
 | `TTL key` | `:seconds`, `+NOEXPIRE`, or `_` |
 | `PING` | `+PONG` |
+| `SAVE` | `:entries_written` — write a snapshot (requires a configured path) |
+| `LOAD` | `:entries_loaded` — read the snapshot back |
 | `QUIT` | `+BYE`, then the connection closes |
 | anything invalid | `-ERR <reason>` — **connection stays open** |
 
@@ -231,7 +236,7 @@ Three executables:
 
 | Binary | What it is |
 | --- | --- |
-| `cachex_server [port] [capacity] [shards]` | The TCP server, thread-per-connection. Defaults: port 6379, capacity 0 (unbounded), 8 shards. |
+| `cachex_server [port] [capacity] [shards] [snapshot] [save-secs]` | The TCP server. Defaults: port 6379, capacity 0 (unbounded), 8 shards, persistence off. |
 | `cachex_client [host] [port]` | Interactive CLI client. |
 | `cachex` | In-process demo of the cache API — no networking, useful for seeing LRU and TTL directly. |
 
@@ -292,6 +297,7 @@ The suite covers four layers:
 | `server_test` | Integration — a real `Server` on a real socket on an OS-assigned port |
 | `concurrency_test` | Parallel readers and writers, mixed GET/SET/DELETE, many simultaneous clients |
 | `sharding_test` | Shard selection and distribution, capacity split, per-shard LRU, concurrent access |
+| `persistence_test` | Save/load round trips, TTL handling, malformed and missing files, saves under concurrent load |
 
 The suite takes ~3 s, almost all of it the TTL tests sleeping. Timing tolerances
 are chosen so only an order-of-magnitude stall could produce a flake; 20
@@ -464,7 +470,66 @@ limit — which is the argument for sharding.
 Full tables and interpretation: [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
 Methodology — and what is deliberately *not* measured yet — is in
-[ARCHITECTURE.md §12](ARCHITECTURE.md#12-benchmark-methodology).
+[ARCHITECTURE.md §13](ARCHITECTURE.md#13-benchmark-methodology).
+
+## Persistence
+
+Give the server a snapshot path to enable it:
+
+```console
+$ ./build/release/bin/cachex_server 6379 0 8 /var/tmp/cachex.cxs 60
+CacheX 0.1.0 listening on 127.0.0.1:6379
+snapshot: /var/tmp/cachex.cxs (auto-save every 60s)
+```
+
+```console
+cachex> SET name ada
++OK
+cachex> SAVE
+:1
+```
+
+...restart the server, and the data is there. TTLs come back as the time that was
+actually left, not a fresh full term.
+
+The format is length-prefixed, so unlike the wire protocol it handles keys and
+values containing spaces, newlines and NUL bytes:
+
+```
+CACHEX-SNAPSHOT 1 1757630400123
+3
+4 3 -1
+nameada
+7 3 3599976
+sessiontok
+```
+
+Writes go to a temp file and are `rename()`d into place, so an interrupted save
+leaves the previous snapshot intact rather than a truncated one. Loads are
+all-or-nothing: a corrupt file is rejected and the cache is left untouched.
+
+### Benchmark
+
+```bash
+./build/release/bin/cachex_persist_bench
+```
+
+| entries | save | load | snapshot | bytes/entry |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.75 ms | 0.52 ms | 87.9 KiB | 90.0 |
+| 10,000 | 4.55 ms | 4.67 ms | 878.9 KiB | 90.0 |
+| 100,000 | 50.54 ms | 48.51 ms | 8.6 MiB | 90.0 |
+| 500,000 | 264.00 ms | 252.25 ms | 42.9 MiB | 90.0 |
+
+Both scale linearly at ~0.5 µs/entry. The snapshot is ~90 bytes/entry against
+~180–200 in memory — it stores only the data, because loading rebuilds the index.
+
+> ⚠️ **What this does not provide.** No `fsync` (a power loss can lose a save that
+> reported success), no write-ahead log (everything since the last save is lost on
+> a crash), no checksums, no incremental saves, no replication. It makes a cache
+> survive a *planned* restart; the data must still be reconstructible from
+> elsewhere. Full comparison against a real database:
+> [ARCHITECTURE.md §10.7](ARCHITECTURE.md#107-what-this-is-not).
 
 ## Project layout
 
@@ -482,6 +547,7 @@ CacheX/
 │   ├── socket.hpp              RAII fd owner, send_all
 │   ├── sync_cache.hpp          thread-safe wrapper: one mutex around Cache
 │   ├── sharded_cache.hpp       N independently locked shards, same API
+│   ├── persistence.hpp         snapshot save/load + periodic saver
 │   ├── connection.hpp          one client's read/dispatch/write loop
 │   ├── server.hpp              accept loop + worker threads
 │   └── version.hpp.in          template → generated into the build tree
@@ -502,10 +568,12 @@ CacheX/
 │   ├── protocol_test.cpp       parser + replies, no sockets
 │   ├── server_test.cpp         integration over a real socket
 │   ├── concurrency_test.cpp    parallel access, many clients
-│   └── sharding_test.cpp       shard selection, capacity split, per-shard LRU
+│   ├── sharding_test.cpp       shard selection, capacity split, per-shard LRU
+│   └── persistence_test.cpp    snapshots, TTL, malformed files, concurrency
 ├── benchmarks/
 │   ├── cache_benchmark.cpp     in-process
-│   ├── net_benchmark.cpp       over TCP
+│   ├── net_benchmark.cpp       over TCP + sharding matrix
+│   ├── persistence_benchmark.cpp  save/load timing and snapshot size
 │   ├── bench_util.hpp          shared timing/percentile helpers
 │   └── RESULTS.md              recorded baselines + hardware caveats
 └── docs/
@@ -533,9 +601,9 @@ request/response behaviour testable without opening a connection.
 | 5 | TCP server + wire protocol + CLI client | ✅ Done |
 | 6 | Concurrency (thread-per-connection + mutex) | ✅ Done |
 | 7 | Sharded cache | ✅ Done |
-| 8 | Benchmark harness II (sub-tick latency) | ⬜ |
-| 9 | Active expiry | ⬜ |
-| 10 | Persistence | ⬜ |
+| 8 | Persistence (snapshots) | ✅ Done |
+| 9 | Benchmark harness II (sub-tick latency) | ⬜ |
+| 10 | Active expiry | ⬜ |
 | 11 | Final optimisation and benchmarking | ⬜ |
 
-Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#16-future-roadmap).
+Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#17-future-roadmap).

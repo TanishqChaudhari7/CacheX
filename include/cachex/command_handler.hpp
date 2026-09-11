@@ -3,6 +3,7 @@
 #include <string>
 
 #include "cachex/sharded_cache.hpp"
+#include "cachex/persistence.hpp"
 #include "cachex/protocol.hpp"
 
 namespace cachex {
@@ -21,6 +22,9 @@ namespace cachex {
 /// server an unsynchronised cache. ShardedCache exposes exactly the same API as
 /// SyncCache, so nothing here knows or cares how many shards there are --
 /// changing the shard count does not touch a line of the network layer.
-std::string execute(ShardedCache& cache, const Command& command);
+/// `persistence` may be null, in which case SAVE and LOAD report that
+/// persistence is not enabled rather than failing in some less obvious way.
+std::string execute(ShardedCache& cache, const Command& command,
+                    PersistenceManager* persistence = nullptr);
 
 }  // namespace cachex

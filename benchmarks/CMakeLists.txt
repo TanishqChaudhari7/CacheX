@@ -22,3 +22,14 @@ target_link_libraries(cachex_net_bench
 target_compile_definitions(cachex_net_bench PRIVATE
   CACHEX_BUILD_TYPE="$<CONFIG>"
   CACHEX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+
+# Persistence has no network and no threads of its own; it gets its own binary
+# so the snapshot numbers are not buried in the networking output.
+add_executable(cachex_persist_bench
+  persistence_benchmark.cpp)
+
+target_link_libraries(cachex_persist_bench PRIVATE cachex_core cachex_warnings)
+
+target_compile_definitions(cachex_persist_bench PRIVATE
+  CACHEX_BUILD_TYPE="$<CONFIG>"
+  CACHEX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

@@ -1,7 +1,7 @@
 # CacheX — Architecture
 
 > Living document. It is updated at every stage of the project.
-> **Current stage: 7 — sharded cache.**
+> **Current stage: 8 — snapshot persistence.**
 
 | Legend | |
 | --- | --- |
@@ -50,7 +50,7 @@ the handful of things that demonstrate the concepts, and nothing more.
 | Concurrency | Multiple clients served safely and, where possible, in parallel | ✅ Stage 6 |
 | Length-prefixed framing | Keys/values containing whitespace or binary data | ⬜ future |
 | Sharding | Cache split into independently locked shards | ✅ Stage 7 |
-| Persistence | Snapshot/restore so state survives a restart | ⬜ Stage 10 |
+| Persistence | Snapshot/restore so state survives a restart | ✅ Stage 8 |
 
 ### Explicitly out of scope
 
@@ -206,7 +206,7 @@ exactly a hash table: average O(1), independent of how many keys are stored.
 **Its weaknesses, stated honestly** — these are the follow-up questions:
 
 - O(1) is *average*, not worst case. Adversarial keys that all hash to one bucket degrade it to O(n). Real caches on untrusted input mitigate this with a randomly seeded hash; CacheX assumes a trusted network (§2), so it does not.
-- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§12).
+- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§13).
 - Growth rehashes every element, so an individual `set` can be O(n) even though the amortised cost is O(1). A *bounded* cache reaches its final bucket count and then stops rehashing, so in the steady state this stops happening at all — one of the quieter benefits of adding capacity.
 
 ### 4.4 Why a doubly linked list
@@ -404,7 +404,7 @@ comparison. One `time_point` answers "is this expired?" with a single `<=`.
 state from any deadline, not a magic value of one. It also buys the performance
 property that matters most: `has_value()` is checked *first*, so an entry without
 a TTL never reads the clock at all. That short-circuit is why TTL is nearly free
-for keys that do not use it — and §12 measures exactly how much it costs for keys
+for keys that do not use it — and §13 measures exactly how much it costs for keys
 that do.
 
 `ttl()` returns a small tagged type rather than an integer:
@@ -1237,6 +1237,208 @@ cache: an event loop instead of a thread per connection attacks the bottleneck
 that is actually binding. Sharding is now in place for when that ceiling lifts —
 which is the right order, because it was chosen from data rather than from
 intuition about which part *looked* slow.
+---
+
+## 10. Persistence
+
+### 10.1 Architecture
+
+```
+   ShardedCache  ──export_entries()──►  PersistenceManager  ──►  snapshot file
+        ▲                                      │
+        └────────────  set() / set(ttl)  ──────┘
+```
+
+`PersistenceManager` talks to the cache **only through its public API**:
+`export_entries()` to read, ordinary `set()` calls to restore. It never touches a
+map, a list or an iterator, and it knows nothing about sockets — the `SAVE` and
+`LOAD` commands are wired up in the network layer, which passes it a pointer.
+
+`export_entries()` is the one new abstraction the cache had to grow, and it
+deliberately returns a plain value type:
+
+```cpp
+struct EntrySnapshot {
+  std::string key;
+  std::string value;
+  std::optional<std::chrono::milliseconds> remaining_ttl;  // nullopt = forever
+};
+```
+
+No iterators, no deadlines tied to this process. That shape is what keeps
+persistence from becoming a second implementation of the cache's internals.
+
+Persistence is **opt-in**: with no snapshot path configured, `SAVE` and `LOAD`
+reply `-ERR persistence is not enabled on this server` rather than writing
+somewhere unexpected.
+
+### 10.2 Format
+
+```
+CACHEX-SNAPSHOT 1 <saved_at_unix_ms>\n
+<entry_count>\n
+  <key_len> <value_len> <ttl_ms>\n        ← repeated entry_count times
+  <key bytes><value bytes>\n
+```
+
+`ttl_ms` is `-1` for an entry that never expires, otherwise the milliseconds
+remaining **at the moment of the save**.
+
+**Length-prefixed, not delimited.** The lengths come first and the payload is
+copied verbatim, so a key or value may contain spaces, newlines or NUL bytes —
+everything the cache can actually hold. This is exactly the framing
+`docs/PROTOCOL.md` names as the fix for the wire protocol's whitespace
+limitation; the snapshot gets it because nothing here has to be typed by a human.
+
+The trailing `\n` after the payload is redundant given the lengths, which is
+precisely why it is checked: if it is missing, the lengths disagreed with the
+file and everything after that point is garbage.
+
+**Why the header carries a wall-clock timestamp.** TTLs are tracked on
+`steady_clock`, which is monotonic but whose epoch is meaningless outside the
+process, so the file cannot store deadlines — only durations. A duration alone is
+not enough either: a key saved with 60 ms left would come back with a *fresh*
+60 ms however long the server was down. The loader needs to know how much
+wall-clock time passed, so `system_clock` is used for that one job and nothing
+else. This was found by a test, not by inspection — the first version had the bug.
+
+Elapsed time is clamped at zero. If the wall clock moved backwards between save
+and load, the subtraction would *extend* every TTL; refusing to go negative means
+the worst a clock jump can do is keep a key slightly too long, never resurrect
+one that should be gone.
+
+### 10.3 Snapshot lifecycle
+
+```
+   server start ──► load(): restore entries, skipping any whose TTL ran out
+                     │        (a missing file is normal, not an error;
+                     │         a corrupt file is logged and the server
+                     │         starts empty rather than refusing to run)
+                     ▼
+   running ──────► SAVE command   → synchronous write, replies with the count
+                └► PeriodicSaver  → optional background thread, on an interval
+                     ▼
+   clean shutdown ─► save(): one final snapshot
+```
+
+A `SAVE` is synchronous: the connection that asked waits for the write. Redis's
+`SAVE` behaves the same way, and its `BGSAVE` — fork the process and let the
+child write a copy-on-write snapshot — is far more machinery than this stage
+wants.
+
+`PeriodicSaver` waits on a condition variable rather than sleeping, so stopping
+is immediate instead of taking up to a full interval, and it is **joined in its
+destructor, never detached** — a detached saver could outlive the cache it
+references.
+
+### 10.4 Consistency under concurrent access
+
+Two separate questions, and it is worth keeping them apart.
+
+**Is the output well-formed while clients are writing? Yes.** Each shard is
+locked, copied, and unlocked, so every record written is a whole record. There is
+no path that produces a torn key or a half-written value. A test runs eight saves
+while six threads churn the cache and checks every snapshot loads cleanly.
+
+**Is it a single point in time? No.** Shards are locked one at a time, so shard 0
+is read slightly before shard N-1 — a key written between the two appears or not
+depending on which shard it lives in. This is the same trade `size()` already
+makes (§9.4), and for the same reason: locking every shard at once would give a
+true instant and would reintroduce exactly the global stall sharding exists to
+remove.
+
+**The file is never open while a lock is held.** `save()` copies the cache out
+first, then writes. A slow disk cannot stall the request path — it only delays
+the connection that issued `SAVE`.
+
+**Writes are atomic.** The snapshot goes to `path.tmp` and is then `rename()`d
+into place. POSIX `rename` is atomic, so an interrupted save leaves either the
+previous snapshot or the new one, never a truncated file. A test verifies that a
+failed save leaves the previous snapshot byte-for-byte intact.
+
+**Loads are all-or-nothing.** The file is parsed and validated completely before
+a single entry is applied, so a corrupt snapshot leaves the cache exactly as it
+was rather than half populated.
+
+### 10.5 Failure modes
+
+| Failure | Behaviour |
+| --- | --- |
+| No snapshot file | `ok`, zero entries — the normal state on a first start |
+| Zero-byte file | Rejected. A truncated file is not an empty cache, and treating it as one would hide a real failure |
+| Wrong magic / unsupported version | Rejected with a reason; cache untouched |
+| Truncated or corrupt record | Rejected with the record index; cache untouched |
+| Length disagrees with payload | Caught by the trailing-newline check |
+| TTL ran out while on disk | Entry skipped, counted in `LoadResult::expired` |
+| Disk full / unwritable path | `save()` fails, temp file removed, previous snapshot intact |
+| Crash mid-save | Previous snapshot intact (the rename never happened) |
+| Crash between saves | **Everything since the last save is lost** — see §10.7 |
+| Corrupt snapshot at startup | Logged; the server starts with an empty cache rather than refusing to run. A cache that will not start is worse than a cold one |
+
+### 10.6 Benchmark results
+
+`cachex_persist_bench`, Release, 16-byte keys and 64-byte values, 8 shards,
+median of 5, on this machine's `/tmp`:
+
+| entries | save | load | save µs/entry | snapshot | bytes/entry |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.75 ms | 0.52 ms | 0.751 | 87.9 KiB | 90.0 |
+| 10,000 | 4.55 ms | 4.67 ms | 0.455 | 878.9 KiB | 90.0 |
+| 100,000 | 50.54 ms | 48.51 ms | 0.505 | 8.6 MiB | 90.0 |
+| 500,000 | 264.00 ms | 252.25 ms | 0.528 | 42.9 MiB | 90.0 |
+
+With a TTL on every entry: 95.0 bytes/entry, and 302 ms / 294 ms at 500,000 —
+the extra five bytes are the millisecond count.
+
+**Both scale linearly** at roughly **0.5 µs per entry** each way, which is what a
+single pass over the data with no index to rebuild should look like.
+
+**Snapshot size against memory:**
+
+| | bytes/entry | vs payload |
+| --- | ---: | ---: |
+| Payload (key + value) | 80 | 1.00x |
+| Snapshot on disk | 90 | 1.13x |
+| Live cache in memory | ~180–200 (estimated) | ~2.4x |
+
+The snapshot is **roughly half the size of the live cache**, because it stores
+only the data. The hash map's buckets and nodes, both list pointers, the
+duplicated key (§10, the eviction trick) and the allocator's overhead all exist
+to make lookups O(1) — none of it is worth writing down, because loading rebuilds
+it. The in-memory figure is an estimate from the data layout, not a measurement.
+
+The number with an operational consequence: **a synchronous `SAVE` of 500,000
+entries blocks the connection that issued it for ~264 ms.** Other clients are
+unaffected — the save holds no lock while writing — but that client is stalled.
+
+### 10.7 What this is NOT
+
+CacheX persistence is a **snapshot**, and that word is doing a lot of work. It is
+not a database, and the gaps are not subtle:
+
+| | CacheX | A production database |
+| --- | --- | --- |
+| **Durability** | Everything written since the last `SAVE` is lost on a crash | A write-ahead log makes every committed write durable before it is acknowledged |
+| **`fsync`** | **Not called.** The data is handed to the OS, not forced to the platter. A power loss can lose a snapshot that `save()` reported as successful | `fsync` on the log (and the directory) before acknowledging |
+| **Atomicity** | Per-snapshot only | Per-transaction, with rollback |
+| **Point-in-time consistency** | Per shard, not global (§10.4) | A true consistent snapshot (MVCC or a fork) |
+| **Incremental** | Full rewrite every time — O(n) per save regardless of how little changed | Append-only log; cost is proportional to the change |
+| **Recovery** | Load the whole file, or start empty | Replay the log from the last checkpoint |
+| **Replication** | None | Snapshots ship to replicas; the primary drives expiry |
+| **Compaction / compression** | None. Plain text, no encoding | Compressed pages, background compaction |
+| **Format stability** | Version 1, no upgrade path written yet | Documented, versioned, migratable |
+| **Integrity** | Length checks only — no checksum, so silent bit-rot is not detected | Per-page checksums |
+
+The honest framing: this makes a **cache** survive a *planned* restart. It does
+not make CacheX a system of record, and data in it should always be
+reconstructible from somewhere else. That is true of any cache — it is just
+easier to forget once there is a file on disk.
+
+⬜ The three things that would most change that picture, roughly in order of
+value per unit of work: `fsync` before the rename (real crash durability), a
+checksum per record (integrity), and an append-only log of changes between
+snapshots (bounded data loss).
+
 
 
 
@@ -1244,7 +1446,7 @@ intuition about which part *looked* slow.
 
 ---
 
-## 10. Complexity
+## 11. Complexity
 
 All bounds assume a hash function that distributes keys reasonably.
 
@@ -1269,20 +1471,20 @@ always `entries_.oldest()` — the tail of the list — reachable in constant ti
 and expiry is only ever checked on an entry an operation is already holding.
 
 **Space: O(n)**, bounded by `capacity` once one is set. Per entry, roughly:
-the key twice (§11), the value once, two list pointers, and the map's node and
+the key twice (§12), the value once, two list pointers, and the map's node and
 bucket overhead. For a 16-byte key and a 64-byte value that is an estimated
 ~180–200 bytes for ~80 bytes of payload. ⬜ *That figure is an estimate from the
 data layout, not a measurement; measuring it properly is Stage 11 work.*
 
 A caveat that matters more than the table: **every operation here is O(1), and
-they still differ by roughly 10× in measured cost** (§12). The constant factors —
+they still differ by roughly 10× in measured cost** (§13). The constant factors —
 allocation, copying, and memory locality — dominate at this scale. The table is
 the right answer to "how does this scale?" and the wrong answer to "which is
 fastest?".
 
 ---
 
-## 11. Ownership and Lifetime
+## 12. Ownership and Lifetime
 
 This is where a cache of this shape goes wrong, so it is worth being precise.
 
@@ -1370,7 +1572,7 @@ tests pin this (`get_missing_key_returns_nullopt`,
 
 ---
 
-## 12. Benchmark Methodology
+## 13. Benchmark Methodology
 
 Source: `benchmarks/cache_benchmark.cpp`. Results: `benchmarks/RESULTS.md`.
 
@@ -1480,7 +1682,7 @@ Headline findings from the Stage 3 run:
 
 ---
 
-## 13. Current Components
+## 14. Current Components
 
 | Path | Purpose | Status |
 | --- | --- | --- |
@@ -1494,6 +1696,7 @@ Headline findings from the Stage 3 run:
 | `include/cachex/server.hpp` | Listening socket, accept loop, worker threads | ✅ |
 | `include/cachex/sync_cache.hpp` | Thread-safe wrapper: one mutex around Cache (one shard) | ✅ |
 | `include/cachex/sharded_cache.hpp` | N independently locked shards; same API | ✅ |
+| `include/cachex/persistence.hpp` | Snapshot save/load and the periodic saver | ✅ |
 | `src/net/` | Implementations of the above | ✅ |
 | `src/server_main.cpp`, `src/client_main.cpp` | `cachex_server`, `cachex_client` | ✅ |
 | `docs/PROTOCOL.md` | The wire protocol specification | ✅ |
@@ -1508,6 +1711,7 @@ Headline findings from the Stage 3 run:
 | `tests/server_test.cpp` | Integration: a real server over a real socket | ✅ |
 | `tests/concurrency_test.cpp` | Parallel readers/writers, mixed workloads, many clients | ✅ |
 | `tests/sharding_test.cpp` | Shard selection, distribution, capacity split, per-shard LRU | ✅ |
+| `tests/persistence_test.cpp` | Save/load round trips, TTL, malformed files, concurrent saves | ✅ |
 | `tests/recency_list_test.cpp` | Ordering and iterator stability | ✅ |
 | `benchmarks/` | `cachex_bench` + `RESULTS.md`; off by default | ✅ |
 | `docs/` | Longer-form notes | — |
@@ -1547,9 +1751,9 @@ server will run.
 
 ---
 
-## 14. Design Decisions
+## 15. Design Decisions
 
-### 14.1 Why C++17 rather than C++20
+### 15.1 Why C++17 rather than C++20
 
 C++17 already contains everything this project needs, and Stage 3 leans on
 `std::optional` twice — once for a lookup that may miss, once for a capacity that
@@ -1564,7 +1768,7 @@ their machine.
 | `std::format` | Convenience only; library support is still uneven. |
 | Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It does not bite yet, but it will when the protocol parser hands over views into a socket buffer (Stage 7). The fix is a transparent hash functor, not a language upgrade. |
 
-### 14.2 Why CMake
+### 15.2 Why CMake
 
 The de-facto standard for C++, so it is what reviewers expect and what IDEs,
 `clangd`, sanitizers, and CI already understand. It makes Debug/Release a
@@ -1572,7 +1776,7 @@ configuration flag rather than hand-maintained compiler invocations. The CMake
 here is **target-based**: properties attach to targets rather than directory-wide
 globals, so include paths and flags travel with the target that needs them.
 
-### 14.3 Why warnings are an INTERFACE target
+### 15.3 Why warnings are an INTERFACE target
 
 `cachex_warnings` carries no code, only flags; targets opt in by linking it.
 Appending to global `CMAKE_CXX_FLAGS` would apply them to any third-party library
@@ -1582,7 +1786,7 @@ past is how a real warning in our own code gets missed.
 `-Werror` is available (`-DCACHEX_WARNINGS_AS_ERRORS=ON`) but off by default, so a
 new compiler version with a new warning cannot break someone's clone.
 
-### 14.4 Why the test framework is hand-written
+### 15.4 Why the test framework is hand-written
 
 ~100 lines of header, no dependency. Only three capabilities are needed: register
 a test, assert a condition, exit non-zero. GoogleTest or Catch2 would be the
@@ -1596,7 +1800,7 @@ a namespace-scope registry could be registered *into* before it was constructed.
 A function-local static is constructed on first use. This is the *static
 initialisation order fiasco*.
 
-### 14.5 Why the tests run under sanitizers
+### 15.5 Why the tests run under sanitizers
 
 The correctness of this design rests on a claim about iterator validity, and
 nothing in the type system enforces it. A dangling `std::list` iterator will
@@ -1613,14 +1817,14 @@ cmake --build build/asan -j --target cachex_tests && ./build/asan/bin/cachex_tes
 leaks --atExit -- ./build/debug/bin/cachex_tests
 ```
 
-### 14.6 Why the version header is generated
+### 15.6 Why the version header is generated
 
 `configure_file()` expands `include/cachex/version.hpp.in` into the build
 directory, substituting the version from `project()`. Otherwise the version lives
 in two places and drifts. The generated header goes in the build tree, never the
 source tree.
 
-### 14.7 Why `build/` is not committed
+### 15.7 Why `build/` is not committed
 
 Build output is reproducible from the sources, specific to one compiler and one
 machine, goes stale the instant a flag changes, and makes every diff unreadable.
@@ -1628,7 +1832,7 @@ Commit the inputs, never the outputs.
 
 ---
 
-## 15. Interview Questions I Should Be Able To Answer
+## 16. Interview Questions I Should Be Able To Answer
 
 ### Why not use only a hash map?
 
@@ -1776,7 +1980,7 @@ it rejects `SET ... EX 0` as an error, and uses `EXPIRE key 0` for the delete.
 ~12% of a GET hit, measured — about 12 ns, which is one `steady_clock::now()`
 read. Keys *without* a TTL pay none of it, because the `optional` is tested
 before the clock is read. That short-circuit is the whole reason TTL is close to
-free for keys that do not use it. §12.
+free for keys that do not use it. §13.
 
 ### How would you test something that depends on time without flaky tests?
 
@@ -2006,6 +2210,57 @@ The measured answer here: the win was monotonic from 1 to 8 shards at 4 threads,
 so 8 was not yet the point of diminishing returns for this workload. A sensible
 default is a small multiple of the core count.
 
+### Why does the snapshot store remaining TTL and a timestamp, rather than deadlines?
+
+Because TTLs are tracked on `steady_clock`, whose epoch is unspecified — a
+deadline from one process means nothing in the next. So the file stores
+*durations*.
+
+A duration alone is not enough either: a key saved with 60 ms left would come
+back with a fresh 60 ms however long the server was down. The header therefore
+carries a `system_clock` timestamp, used for exactly one thing — measuring how
+long the file sat on disk — and the loader subtracts it. Elapsed time is clamped
+at zero so a backwards clock jump can never *extend* a TTL.
+
+This was found by a test, not by inspection. The first version had the bug.
+
+### How do you take a snapshot without corrupting it while clients are writing?
+
+Two questions that are worth separating.
+
+**Well-formed output:** each shard is locked, copied, unlocked — so every record
+written is a whole record. The file is never open while a lock is held, so a slow
+disk cannot stall the request path.
+
+**A single point in time:** it is *not* one. Shards are locked one at a time, so
+shard 0 is read slightly before shard N-1. Locking all of them at once would give
+a true instant and would reintroduce the global stall sharding exists to remove.
+That is a deliberate trade, and it is the same one `size()` makes.
+
+The write itself is atomic: temp file, then `rename()`, which POSIX guarantees is
+atomic. An interrupted save leaves the old snapshot or the new one, never a
+truncated file.
+
+### What does CacheX persistence NOT give you?
+
+Durability, mainly. `fsync` is never called, so a power loss can lose a snapshot
+that `save()` reported as successful. Everything written since the last save is
+gone on a crash — there is no write-ahead log. Saves are full rewrites, O(n)
+regardless of how little changed. There is no checksum, so silent corruption is
+not detected, and no replication or compaction.
+
+It makes a **cache** survive a *planned* restart. It does not make CacheX a
+system of record, and the data must always be reconstructible from somewhere
+else. §10.7 has the full comparison.
+
+### Why do SAVE and LOAD take no arguments?
+
+Because the snapshot path is server configuration, never something a client
+supplies. Accepting a path over the network would let any client read or
+overwrite an arbitrary file the server process can reach — a path-traversal hole
+handed over for free. The server is configured with one path; clients can only
+ask it to use that one.
+
 ### How would you test that eviction is correct?
 
 Not by checking `size()` — that passes even if the *wrong* entry is evicted. The
@@ -2016,7 +2271,7 @@ test that verifies the map and the list still agree on which keys exist.
 
 ---
 
-## 16. Future Roadmap
+## 17. Future Roadmap
 
 **Everything below is ⬜ future work.**
 
@@ -2028,10 +2283,10 @@ test that verifies the map and the list still agree on which keys exist.
 | 4 | TTL | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
 | 5 | **TCP server + protocol** | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
 | 6 | **Concurrency** | Thread-per-connection, SyncCache, scaling benchmark | Data races, mutexes, contention, why `shared_mutex` disappoints for LRU | ✅ |
-| 8 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
+| 9 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
 | 7 | **Sharded cache** | N independently locked shards, A/B/C/D benchmark matrix | Lock contention; when optimising the wrong thing changes nothing | ✅ |
-| 9 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
-| 10 | Persistence | Snapshot to disk, restore on startup | Serialisation; durability vs. throughput | ⬜ |
+| 10 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
+| 8 | **Persistence** | Snapshot to disk, restore on startup, SAVE/LOAD | Serialisation; atomic replace; what a cache is *not* | ✅ |
 | 11 | Final optimisation | Profile, tune, re-benchmark against the recorded baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
 
 Stage numbering note: active expiry sits after concurrency and sharding because
@@ -2039,5 +2294,5 @@ it cannot safely precede thread safety (§6.5). Earlier documents referred to
 concurrency as "Stage 7" or "Stage 8"; the ordering is what matters, not the
 number.
 
-Each stage ends with this document updated: components in §13, decisions in §14,
-new questions in §15, and the diagram in §3 grown to match what actually exists.
+Each stage ends with this document updated: components in §14, decisions in §15,
+new questions in §16, and the diagram in §3 grown to match what actually exists.

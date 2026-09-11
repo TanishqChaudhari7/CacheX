@@ -20,7 +20,7 @@ inline constexpr std::size_t kMaxLineBytes = 64 * 1024;
 /// arithmetic, and nothing legitimate needs more.
 inline constexpr long long kMaxTtlSeconds = 315360000;
 
-enum class CommandType { Set, Get, Delete, Exists, Ttl, Ping, Quit };
+enum class CommandType { Set, Get, Delete, Exists, Ttl, Ping, Save, Load, Quit };
 
 struct Command {
   CommandType type = CommandType::Ping;

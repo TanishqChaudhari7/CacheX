@@ -2,7 +2,8 @@
 
 namespace cachex {
 
-std::string execute(ShardedCache& cache, const Command& command) {
+std::string execute(ShardedCache& cache, const Command& command,
+                    PersistenceManager* persistence) {
   switch (command.type) {
     case CommandType::Set:
       if (command.ttl.has_value()) {
@@ -43,6 +44,27 @@ std::string execute(ShardedCache& cache, const Command& command) {
 
     case CommandType::Ping:
       return reply_pong();
+
+    case CommandType::Save: {
+      if (persistence == nullptr) {
+        return reply_error("persistence is not enabled on this server");
+      }
+      // Synchronous: the connection that asked waits for the write. Redis's
+      // SAVE behaves the same way, and its BGSAVE (fork and write in the
+      // background) is a much larger piece of machinery than this stage wants.
+      const PersistenceManager::SaveResult saved = persistence->save(cache);
+      return saved.ok ? reply_integer(static_cast<long long>(saved.entries))
+                      : reply_error("save failed: " + saved.error);
+    }
+
+    case CommandType::Load: {
+      if (persistence == nullptr) {
+        return reply_error("persistence is not enabled on this server");
+      }
+      const PersistenceManager::LoadResult loaded = persistence->load(cache);
+      return loaded.ok ? reply_integer(static_cast<long long>(loaded.loaded))
+                       : reply_error("load failed: " + loaded.error);
+    }
 
     case CommandType::Quit:
       return reply_bye();

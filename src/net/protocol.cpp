@@ -158,6 +158,15 @@ ParseResult parse_command(std::string_view line) {
   if (verb == "PING") {
     return parse_no_args(CommandType::Ping, "PING", tokens);
   }
+  // SAVE and LOAD take no arguments *on purpose*: the snapshot path is server
+  // configuration, never something a client supplies. Accepting a path from the
+  // network would let any client read or overwrite an arbitrary file.
+  if (verb == "SAVE") {
+    return parse_no_args(CommandType::Save, "SAVE", tokens);
+  }
+  if (verb == "LOAD") {
+    return parse_no_args(CommandType::Load, "LOAD", tokens);
+  }
   if (verb == "QUIT") {
     return parse_no_args(CommandType::Quit, "QUIT", tokens);
   }
@@ -179,6 +188,10 @@ const char* command_name(CommandType type) {
       return "TTL";
     case CommandType::Ping:
       return "PING";
+    case CommandType::Save:
+      return "SAVE";
+    case CommandType::Load:
+      return "LOAD";
     case CommandType::Quit:
       return "QUIT";
   }
