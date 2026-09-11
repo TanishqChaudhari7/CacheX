@@ -57,6 +57,8 @@ class ShardedCache {
   void set(std::string key, std::string value);
   void set(std::string key, std::string value, Duration ttl);
   std::optional<std::string> get(const std::string& key);
+  /// See Cache::get_into.
+  bool get_into(const std::string& key, std::string& out);
   bool erase(const std::string& key);
   bool contains(const std::string& key);
   TtlInfo ttl(const std::string& key);

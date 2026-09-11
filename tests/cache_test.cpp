@@ -1,6 +1,7 @@
 #include "cachex/cache.hpp"
 
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "test_framework.hpp"
@@ -388,4 +389,81 @@ CACHEX_TEST(recency_order_survives_heavy_churn) {
   CHECK_EQ(order.size(), cache.size());
   CHECK_EQ(order.size(), 100u);
   CHECK_EQ(order.front(), "k199");  // the last key touched
+}
+
+// --- get_into --------------------------------------------------------------
+
+CACHEX_TEST(get_into_returns_the_value_through_the_caller_buffer) {
+  cachex::Cache cache;
+  cache.set("k", "value");
+
+  std::string out;
+  CHECK(cache.get_into("k", out));
+  CHECK_EQ(out, "value");
+}
+
+CACHEX_TEST(get_into_reports_a_miss_without_touching_the_buffer) {
+  cachex::Cache cache;
+  std::string out = "untouched";
+
+  CHECK(!cache.get_into("absent", out));
+  CHECK_EQ(out, "untouched");
+  CHECK_EQ(cache.size(), 0u);  // a miss must not insert
+}
+
+CACHEX_TEST(get_into_agrees_with_get_on_every_case) {
+  cachex::Cache cache;
+  cache.set("present", "value");
+  cache.set("empty", "");
+
+  std::string out;
+  CHECK_EQ(cache.get_into("present", out), cache.get("present").has_value());
+  CHECK_EQ(out, cache.get("present").value_or("?"));
+
+  CHECK(cache.get_into("empty", out));
+  CHECK_EQ(out, "");  // an empty value is a hit, not a miss
+
+  CHECK_EQ(cache.get_into("absent", out), cache.get("absent").has_value());
+}
+
+CACHEX_TEST(get_into_counts_as_a_use_like_get_does) {
+  cachex::Cache cache(3);
+  cache.set("a", "1");
+  cache.set("b", "2");
+  cache.set("c", "3");
+
+  std::string out;
+  cache.get_into("a", out);   // must promote "a" exactly as get() would
+  cache.set("d", "4");
+
+  CHECK(cache.contains("a"));
+  CHECK(!cache.contains("b"));
+}
+
+CACHEX_TEST(get_into_reuses_the_buffer_across_calls) {
+  cachex::Cache cache;
+  cache.set("long", std::string(500, 'x'));
+  cache.set("short", "s");
+
+  std::string out;
+  CHECK(cache.get_into("long", out));
+  const std::size_t capacity_after_long = out.capacity();
+
+  // Reading a short value must not shrink the buffer -- that reuse is the whole
+  // reason this overload exists.
+  CHECK(cache.get_into("short", out));
+  CHECK_EQ(out, "s");
+  CHECK(out.capacity() >= capacity_after_long);
+}
+
+CACHEX_TEST(get_into_reclaims_an_expired_entry_like_get_does) {
+  cachex::Cache cache;
+  cache.set("k", "v", std::chrono::milliseconds(30));
+  std::this_thread::sleep_for(std::chrono::milliseconds(130));
+
+  std::string out = "untouched";
+  CHECK(!cache.get_into("k", out));
+  CHECK_EQ(out, "untouched");
+  CHECK_EQ(cache.size(), 0u);
+  CHECK_EQ(cache.expired_removals(), 1u);
 }

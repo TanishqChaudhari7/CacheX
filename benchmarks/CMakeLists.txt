@@ -33,3 +33,14 @@ target_link_libraries(cachex_persist_bench PRIVATE cachex_core cachex_warnings)
 target_compile_definitions(cachex_persist_bench PRIVATE
   CACHEX_BUILD_TYPE="$<CONFIG>"
   CACHEX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+
+# The full suite: every workload against every version, with one set of metrics.
+add_executable(cachex_bench_suite
+  bench_suite.cpp)
+
+target_link_libraries(cachex_bench_suite
+  PRIVATE cachex_core cachex_warnings Threads::Threads)
+
+target_compile_definitions(cachex_bench_suite PRIVATE
+  CACHEX_BUILD_TYPE="$<CONFIG>"
+  CACHEX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

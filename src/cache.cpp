@@ -113,6 +113,24 @@ std::optional<std::string> Cache::get(const std::string& key) {
   return it->second->value;
 }
 
+bool Cache::get_into(const std::string& key, std::string& out) {
+  const auto it = index_.find(key);
+  if (it == index_.end()) {
+    return false;
+  }
+  if (is_expired(*it->second)) {
+    remove(it);
+    ++expired_removals_;
+    return false;
+  }
+  entries_.mark_used(it->second);
+
+  // assign() reuses out's existing capacity when it is large enough, so a
+  // caller that keeps one buffer around allocates nothing per hit.
+  out.assign(it->second->value);
+  return true;
+}
+
 TtlInfo Cache::ttl(const std::string& key) {
   const auto it = index_.find(key);
   if (it == index_.end()) {

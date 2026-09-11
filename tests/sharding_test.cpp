@@ -376,3 +376,21 @@ CACHEX_TEST(shard_count_does_not_change_observable_behaviour) {
     CHECK(!cache.contains("y"));
   }
 }
+
+CACHEX_TEST(get_into_routes_to_the_right_shard) {
+  cachex::ShardedCache cache(8);
+  for (int i = 0; i < 200; ++i) {
+    cache.set("k" + std::to_string(i), "v" + std::to_string(i));
+  }
+
+  std::string out;
+  bool all_correct = true;
+  for (int i = 0; i < 200; ++i) {
+    if (!cache.get_into("k" + std::to_string(i), out) ||
+        out != "v" + std::to_string(i)) {
+      all_correct = false;
+    }
+  }
+  CHECK(all_correct);
+  CHECK(!cache.get_into("absent", out));
+}

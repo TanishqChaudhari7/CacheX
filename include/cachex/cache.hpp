@@ -103,6 +103,18 @@ class Cache {
   /// O(1) average.
   std::optional<std::string> get(const std::string& key);
 
+  /// Like get(), but copies into a caller-supplied buffer instead of returning
+  /// a fresh string. Returns false on a miss, leaving `out` untouched.
+  ///
+  /// The point is the allocation. get() builds a new std::string for every hit,
+  /// and for values past the small-string limit that is a malloc and a free per
+  /// lookup -- which profiling showed to be a real share of the read path. A
+  /// caller that reuses one buffer pays that once instead of once per call.
+  ///
+  /// Same semantics as get() in every other respect: it counts as a use, and it
+  /// reclaims the entry if it has expired. O(1) average.
+  bool get_into(const std::string& key, std::string& out);
+
   /// Removes a key. Returns false if it was not present.
   /// An expired-but-not-yet-reclaimed entry counts as not present: it is
   /// reclaimed, and the call returns false, because nothing user-visible was

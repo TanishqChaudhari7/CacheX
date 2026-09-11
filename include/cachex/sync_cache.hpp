@@ -52,6 +52,12 @@ class SyncCache {
     return cache_.get(key);
   }
 
+  /// See Cache::get_into. Exclusive, like get(), for the same reason.
+  bool get_into(const std::string& key, std::string& out) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    return cache_.get_into(key, out);
+  }
+
   bool erase(const std::string& key) {
     const std::lock_guard<std::mutex> lock(mutex_);
     return cache_.erase(key);

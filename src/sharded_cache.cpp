@@ -78,6 +78,10 @@ std::optional<std::string> ShardedCache::get(const std::string& key) {
   return shard_for(key).get(key);
 }
 
+bool ShardedCache::get_into(const std::string& key, std::string& out) {
+  return shard_for(key).get_into(key, out);
+}
+
 bool ShardedCache::erase(const std::string& key) {
   return shard_for(key).erase(key);
 }

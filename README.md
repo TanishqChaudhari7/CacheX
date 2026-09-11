@@ -14,7 +14,20 @@ it, and the full roadmap.
 
 ## Status
 
-**Stage 8 of 11 — snapshot persistence.**
+**Stage 9 of 11 — benchmark suite, profiling and a measured optimisation.**
+
+A standardised suite runs 5 workloads against 3 versions at 5 thread counts,
+reporting throughput, p50/p95/p99, hit ratio, evictions and errors. Profiling with
+macOS `sample` found a per-hit heap allocation on the read path; removing it is
+worth **+42%** throughput, measured before and after. 212 tests pass under ASan,
+UBSan and TSan with zero leaks.
+
+**[Performance Evaluation](ARCHITECTURE.md#performance-evaluation)** ·
+**[Resume-Ready Metrics](ARCHITECTURE.md#resume-ready-metrics)**
+
+<details>
+<summary>Stage 8 — snapshot persistence</summary>
+
 
 The cache can now survive a restart. `SAVE` writes every live entry to a snapshot
 file, the server reloads it on startup, and an optional background thread saves on
@@ -27,6 +40,8 @@ leaks.
 write-ahead log, so everything written since the last save is lost on a crash.
 [What it does not provide](ARCHITECTURE.md#107-what-this-is-not).
 
+</details>
+
 | | |
 | --- | --- |
 | ✅ Stage 1 | CMake build, Debug/Release, strict warnings, test framework |
@@ -36,9 +51,9 @@ write-ahead log, so everything written since the last save is lost on a crash.
 | ✅ Stage 5 | TCP server, line protocol, CLI client, network benchmark |
 | ✅ Stage 6 | Thread-per-connection, `SyncCache`, TSan clean, scaling benchmark |
 | ✅ Stage 7 | Sharded cache, A/B/C/D × 1–16 client benchmark matrix |
-| ✅ Stage 8 | Snapshot persistence, `SAVE`/`LOAD`, 205 tests |
-| ⬜ Next | Stage 9 — benchmark harness II (sub-tick latency) |
-| ⬜ Later | active expiry · event loop · optimisation |
+| ✅ Stage 8 | Snapshot persistence, `SAVE`/`LOAD` |
+| ✅ Stage 9 | Benchmark suite, profiling, `get_into()` (+42%), 212 tests |
+| ⬜ Later | active expiry · event loop · further optimisation |
 
 ## Try it
 
@@ -531,6 +546,34 @@ Both scale linearly at ~0.5 µs/entry. The snapshot is ~90 bytes/entry against
 > elsewhere. Full comparison against a real database:
 > [ARCHITECTURE.md §10.7](ARCHITECTURE.md#107-what-this-is-not).
 
+## Benchmark suite
+
+```bash
+./build/release/bin/cachex_bench_suite
+```
+
+Five workloads (read-heavy, balanced, write-heavy, high-churn, TTL-heavy) × three
+versions (no locking / global mutex / 8 shards) × five thread counts, all from one
+fixed seed so every version replays the identical operation sequence.
+
+Headline measured results:
+
+| | |
+| --- | --- |
+| Single-threaded, read-heavy | **5.97 M ops/sec**, p50 125 ns, 78.95% hit rate |
+| Sharded vs global mutex, 4 threads | **+120% to +275%** throughput, **−61% to −78%** p99 |
+| Profiling-driven optimisation | **+42%** from removing a per-hit allocation |
+| Memory | **221 bytes/entry** measured (2.76× an 80-byte payload) |
+
+⚠️ **The honest headline is uncomfortable:** on this hardware *no* multi-threaded
+configuration beats the single-threaded baseline. A cache operation costs ~167 ns
+and touches shared memory, so thread coordination costs more than the parallelism
+buys. Sharding's measured value is beating the global mutex under concurrency —
+not scaling past one thread.
+
+Full environment, methodology, profile and limitations:
+[ARCHITECTURE.md → Performance Evaluation](ARCHITECTURE.md#performance-evaluation).
+
 ## Project layout
 
 ```
@@ -574,6 +617,7 @@ CacheX/
 │   ├── cache_benchmark.cpp     in-process
 │   ├── net_benchmark.cpp       over TCP + sharding matrix
 │   ├── persistence_benchmark.cpp  save/load timing and snapshot size
+│   ├── bench_suite.cpp         the full workload × version × thread matrix
 │   ├── bench_util.hpp          shared timing/percentile helpers
 │   └── RESULTS.md              recorded baselines + hardware caveats
 └── docs/
@@ -602,7 +646,7 @@ request/response behaviour testable without opening a connection.
 | 6 | Concurrency (thread-per-connection + mutex) | ✅ Done |
 | 7 | Sharded cache | ✅ Done |
 | 8 | Persistence (snapshots) | ✅ Done |
-| 9 | Benchmark harness II (sub-tick latency) | ⬜ |
+| 9 | Benchmark suite + profiling | ✅ Done |
 | 10 | Active expiry | ⬜ |
 | 11 | Final optimisation and benchmarking | ⬜ |
 
