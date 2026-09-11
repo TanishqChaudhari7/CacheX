@@ -1,0 +1,129 @@
+CacheX network benchmark
+========================
+
+build        : Release
+compiler     : AppleClang 21.0.0.21000101
+transport    : TCP over loopback, port 54807, TCP_NODELAY on
+clients      : 1 (blocking, one request in flight at a time)
+server       : single-threaded, one connection at a time
+requests     : 20000 per phase
+value size   : 64 bytes
+clock        : steady_clock, overhead 24.6 ns/read, tick 41.0 ns
+
+phase       requests       req/sec    avg (us)        p50        p95        p99    max (us)
+-------------------------------------------------------------------------------------------
+PING           20000         50149       19.94      19.67      24.88      34.04      177.42
+SET            20000         46495       21.51      20.42      27.71      38.58      239.46
+GET            20000         47498       21.05      20.33      26.46      33.54      178.04
+
+  PING is the floor: a full round trip that touches no cache data,
+  so the gap between it and SET/GET is the cache work, and PING
+  itself is what the transport costs.
+
+  Percentiles here are real measurements, not tick counts: a round
+  trip is tens of microseconds against a 41 ns clock tick -- unlike the
+  in-process benchmark, where the tick swamped the operation.
+
+  entries in cache: 20000   checksum: 2940000
+
+
+SHARDING OVER TCP
+=================
+32000 requests per configuration, split across N clients.
+Version A = 1 shard (one global mutex), B = 2, C = 4, D = 8.
+Clients and server share this machine's 12 hardware threads.
+
+GET (all hits) -- throughput (req/sec)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 47671        47721        48020        46883           +0.7%
+2                 79319        82943        83772        80034           +5.6%
+4                 93059        89666        91903        92218           +0.0%
+8                121302       122767       122145       117126           +1.2%
+16               122268       120713       122459       124161           +1.5%
+
+GET (all hits) -- p99 latency (us)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 32.29        31.92        30.54        34.17           -5.4%
+2                 49.42        40.21        38.50        48.71          -22.1%
+4                 58.75        57.54        58.21        59.17           -2.1%
+8                 86.96        83.25        84.33        96.62           -4.3%
+16               169.17       181.88       172.58       150.71          -10.9%
+
+GET (all hits) -- scaling vs 1 client, per shard count
+
+clients         1 shard     2 shards     4 shards     8 shards
+--------------------------------------------------------------
+1                 1.00x        1.00x        1.00x        1.00x
+2                 1.66x        1.74x        1.74x        1.71x
+4                 1.95x        1.88x        1.91x        1.97x
+8                 2.54x        2.57x        2.54x        2.50x
+16                2.56x        2.53x        2.55x        2.65x
+
+SET -- throughput (req/sec)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 46000        47478        47596        46001           +3.5%
+2                 82183        82321        83706        82438           +1.9%
+4                 91589        91719        90094        90990           +0.1%
+8                119289       120409       117239       121350           +1.7%
+16               123277       123042       123116       121054           +0.0%
+
+SET -- p99 latency (us)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 38.67        31.04        30.38        38.04          -21.4%
+2                 44.42        41.88        38.42        42.17          -13.5%
+4                 59.04        58.17        59.42        58.29           -1.5%
+8                 91.25        84.33        92.92        83.79           -8.2%
+16               150.54       152.71       152.08       159.46           +0.0%
+
+SET -- scaling vs 1 client, per shard count
+
+clients         1 shard     2 shards     4 shards     8 shards
+--------------------------------------------------------------
+1                 1.00x        1.00x        1.00x        1.00x
+2                 1.79x        1.73x        1.76x        1.79x
+4                 1.99x        1.93x        1.89x        1.98x
+8                 2.59x        2.54x        2.46x        2.64x
+16                2.68x        2.59x        2.59x        2.63x
+
+
+SHARDING IN-PROCESS (no sockets)
+================================
+N threads calling ShardedCache::get() directly, 600000 total calls.
+
+threads         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1               7605053      7164450      7254499      7198398           +0.0%
+2               4129708      3734589      4138874      4474057           +8.3%
+4               1789858      3478510      4492817      7261673         +305.7%
+8               3298873      2415784      3111601      4610772          +39.8%
+16              3408562      2224526      2828890      4089275          +20.0%
+
+
+GLOBAL LRU vs PER-SHARD LRU (hit rate cost of sharding)
+======================================================
+Skewed 80/20 workload, cache-aside, single-threaded so only
+the eviction policy differs.
+
+capacity          1 shard     2 shards     4 shards     8 shards          cost
+------------------------------------------------------------------------------
+5% (5000)          15.92%       15.91%       15.93%       15.90%        -0.01pp
+10% (10000)        30.92%       30.92%       30.91%       30.93%        -0.02pp
+20% (20000)        57.78%       57.79%       57.81%       57.78%        +0.00pp
+40% (40000)        84.21%       84.21%       84.21%       84.20%        -0.01pp
+
+  'cost' is the worst shard count's hit rate minus the
+  1-shard (true global LRU) hit rate, in percentage points.
+
+  (checksum 768000000)
+
+  'best vs 1' compares the best shard count against 1 shard at
+  the same client count -- positive is better for throughput,
+  negative is better for p99 latency.

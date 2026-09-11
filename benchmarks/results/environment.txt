@@ -1,0 +1,12 @@
+CacheX benchmark environment
+============================
+date        : 2026-09-11T17:29:55Z (UTC)
+git commit  : af855f4
+git dirty   : yes
+uname       : Darwin 25.5.0 arm64
+cpu         : Apple M2 Pro
+cores       : 12
+memory      : 16 GB
+os          : macOS 26.5.2
+load        : load averages: 3.32 3.06 2.79
+compiler    : Apple clang version 21.0.0 (clang-2100.1.1.101)

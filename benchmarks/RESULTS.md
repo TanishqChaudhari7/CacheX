@@ -16,6 +16,106 @@ cmake --build build/release -j
 
 ---
 
+## Stage 9 — benchmark suite and profiling
+
+Raw output for everything below is committed in `results/`. Regenerate with
+`./run_all.sh`; `results/environment.txt` records the machine, the commit and the
+load average at capture time.
+
+| | |
+| --- | --- |
+| Binary | `cachex_bench_suite` |
+| Runs | 5, median reported, range given where wide |
+| Workloads | read-heavy, balanced, write-heavy, high-churn, ttl-heavy |
+| Versions | A = `Cache` (no locking), B = `SyncCache` (global mutex), C = `ShardedCache(8)` |
+| Operations | 400,000 per workload, seed 20260911, replayed identically by each version |
+
+### read-heavy, median of 5
+
+| version | threads | ops/sec | range | p50 | p95 | p99 | hit % |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| A baseline | 1 | **6,039,943** | 4.62 M – 6.09 M | 125 | 333 | 375 | 78.95 |
+| B mutex | 1 | 5,049,065 | 4.09 M – 5.67 M | 125 | 375 | 541 | 78.95 |
+| B mutex | 2 | 2,417,427 | 2.01 M – 2.51 M | 167 | 2,584 | 14,916 | 78.96 |
+| B mutex | 4 | 1,079,059 | 1.02 M – 1.20 M | 375 | 19,541 | 46,458 | 78.98 |
+| B mutex | 8 | 1,657,196 | 1.49 M – 1.89 M | 292 | 15,625 | 50,542 | 78.96 |
+| B mutex | 16 | 1,880,650 | 1.69 M – 2.02 M | 250 | 14,875 | 91,625 | 78.94 |
+| C sharded | 1 | 5,091,112 | 3.71 M – 5.17 M | 125 | 375 | 459 | 78.96 |
+| C sharded | 2 | 3,226,120 | 2.82 M – 3.54 M | 250 | 3,167 | 5,750 | 78.96 |
+| C sharded | 4 | 3,152,839 | 2.97 M – 3.43 M | 333 | 6,208 | 12,750 | 78.98 |
+| C sharded | 8 | 2,956,268 | 2.81 M – 3.23 M | 417 | 14,917 | 27,834 | 78.97 |
+| C sharded | 16 | 2,765,883 | 2.74 M – 2.91 M | 500 | 34,833 | 62,542 | 78.91 |
+
+Zero errors and ~44,200 evictions everywhere. Hit rate spans 78.91–78.98% across
+all eleven configurations and all five runs — the check that every version really
+did receive the identical workload.
+
+### C vs B at matched thread counts (median of 5)
+
+Throughput:
+
+| workload | 1t | 2t | 4t | 8t | 16t |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| read-heavy | −8.8% | +28.6% | **+174.9%** | +69.3% | +46.9% |
+| balanced | −13.1% | +16.3% | **+197.0%** | +56.2% | +57.1% |
+| write-heavy | −8.3% | +22.1% | **+178.7%** | +94.1% | +67.0% |
+| high-churn | −11.0% | +29.1% | **+197.7%** | +67.1% | +35.9% |
+| ttl-heavy | −4.3% | +44.5% | **+234.6%** | +66.4% | +57.0% |
+
+p99 latency (negative is better):
+
+| workload | 1t | 2t | 4t | 8t | 16t |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| read-heavy | +9.8% | −59.5% | **−69.3%** | −36.7% | −33.1% |
+| balanced | +13.3% | −55.8% | **−72.7%** | −32.8% | −46.8% |
+| write-heavy | +9.8% | −60.4% | **−69.6%** | −54.4% | −68.8% |
+| high-churn | +13.3% | −66.8% | **−75.2%** | −49.5% | −62.2% |
+| ttl-heavy | +9.2% | −62.1% | **−76.1%** | −38.6% | −56.4% |
+
+### Optimisation: `get_into()`
+
+Profiling (`sample`, 8 s) ranked mutex contention first (~13,700 samples) and
+malloc/free next. `get()` returns `optional<string>`, so every hit on a 64-byte
+value is one malloc and one free. `get_into()` assigns into a caller-owned buffer.
+
+| variant | ops/sec (median) | range | avg ns | p50 |
+| --- | ---: | --- | ---: | ---: |
+| `get()` | 5,118,081 | 4.47 M – 5.41 M | 195.4 | 125 |
+| `get_into()` | **7,634,589** | 6.05 M – 7.85 M | 131.0 | 83 |
+
+**Median +45.3%**, per-run range **+18.2% to +72.9%**. The spread is machine
+noise: the two variants run back to back, and a busy machine sinks the `get()`
+baseline further than `get_into()`, inflating the ratio. The claim worth making is
+the median, with +18% as the worst actually observed.
+
+### Memory per entry — measured
+
+| entries | heap delta | bytes/entry | vs payload |
+| ---: | ---: | ---: | ---: |
+| 100,000 | 20.6 MiB | 216.4 | 2.70× |
+| 250,000 | 52.7 MiB | 221.2 | 2.76× |
+| 500,000 | 105.5 MiB | 221.2 | 2.76× |
+
+**221 bytes/entry**, identical in all five runs. This corrects the "~180–200
+estimated" figure carried since Stage 3 — the real number is higher.
+
+### Two measurement bugs, both caught by an impossible result
+
+1. **Memory measured with RSS** reported **0 bytes/entry** for 100k entries, because the allocator had already grown the heap and never returns pages. Fixed by using `malloc` bytes-in-use.
+2. **No warm-up before version A**, which ran first in each workload and absorbed the page-fault and allocator cost. That made the *unlocked* baseline measure slower than the mutex version at one thread — impossible, since B does strictly more work. Fixed with a discarded pass per workload.
+
+Neither was found by reading the code. Both were found by noticing a number that
+could not be true.
+
+### The headline, unflattering
+
+**No multi-threaded configuration beats the single-threaded baseline.** A
+cache operation costs ~170 ns and touches shared memory; thread coordination
+costs more than the parallelism buys. Sharding's measured value is beating the
+global mutex under concurrency, not scaling past one thread.
+
+---
+
 ## Stage 8 — persistence
 
 `cachex_persist_bench`, Release, 16-byte keys / 64-byte values, 8 shards, median
@@ -60,7 +160,7 @@ measure that.
 | --- | ---: | ---: |
 | Payload (key + value) | 80 | 1.00x |
 | Snapshot on disk | 90 | 1.13x |
-| Live cache in memory | ~180–200 (estimated) | ~2.4x |
+| Live cache in memory | **221 (measured)** | 2.76x |
 
 The snapshot is **roughly half the size of the live cache**. It stores only the
 data; the hash map's buckets and nodes, both list pointers, the duplicated key
@@ -69,8 +169,9 @@ worth writing down because loading rebuilds it.
 
 The 10 bytes of snapshot overhead per entry are the length header
 (`<key_len> <value_len> <ttl_ms>\n`) plus the trailing newline. The in-memory
-figure is an estimate from the data layout, **not a measurement** — measuring it
-properly is still open.
+figure was an estimate when this was written; **Stage 9 measured it at 221
+bytes/entry**, so the snapshot is ~2.5× smaller than the live cache rather than
+the ~2× originally suggested.
 
 ### The number with an operational consequence
 
@@ -719,6 +820,6 @@ order-alternated, rather than against a number recorded on another day.
 - **Average and tick-quantised percentiles only.** No sub-tick resolution. ⬜ Stage 5.
 - **Single-threaded.** No contention, no scaling data. ⬜ Stage 7.
 - **One key size, one value size.** 16-byte keys (small-string, no allocation) and 64-byte values (heap-allocated). Behaviour at other sizes is not characterised.
-- **Memory per entry is not measured.** ARCHITECTURE §6 gives an estimate from the data layout; that is not the same as a measurement. ⬜ Stage 11.
+- ~~Memory per entry is not measured~~ — ✅ measured in Stage 9: **221 bytes/entry**.
 - **Two synthetic distributions.** 80/20 skew and uniform. Real traffic is Zipfian with a time-varying hot set, and neither of these captures a working set that shifts.
 - **In-process.** No sockets, no protocol parsing, no syscalls. The Stage 5 section above measures the same cache over TCP, where these per-operation costs turn out to be 2-3% of a request.

@@ -391,6 +391,20 @@ int main() {
               << ", cache-aside " << (spec.cache_aside ? "on" : "off") << "\n\n";
     print_header();
 
+    // A discarded pass before anything is measured.
+    //
+    // Without it, whichever version runs first absorbs the cost of faulting in
+    // this workload's pages and growing the allocator -- and that is always A,
+    // which made the *unlocked* baseline measure slower than the mutex version
+    // at one thread. An impossible result, and entirely an artefact of ordering.
+    {
+      cachex::Cache warmup =
+          spec.capacity ? cachex::Cache(*spec.capacity) : cachex::Cache();
+      const Metrics discarded =
+          run(warmup, spec, ops, keys, value, "warm-up", 1);
+      g_sink += discarded.total_ops;
+    }
+
     // A -- baseline: the raw Cache, single threaded, no locking anywhere.
     {
       cachex::Cache cache =

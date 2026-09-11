@@ -1399,13 +1399,15 @@ single pass over the data with no index to rebuild should look like.
 | --- | ---: | ---: |
 | Payload (key + value) | 80 | 1.00x |
 | Snapshot on disk | 90 | 1.13x |
-| Live cache in memory | ~180–200 (estimated) | ~2.4x |
+| Live cache in memory | **221 (measured)** | 2.76x |
 
 The snapshot is **roughly half the size of the live cache**, because it stores
 only the data. The hash map's buckets and nodes, both list pointers, the
 duplicated key (§10, the eviction trick) and the allocator's overhead all exist
 to make lookups O(1) — none of it is worth writing down, because loading rebuilds
-it. The in-memory figure is an estimate from the data layout, not a measurement.
+it. The in-memory figure was an estimate when this was written and was measured
+in Stage 9 at **221 bytes/entry**, so the snapshot is ~2.5× smaller than the live
+cache.
 
 The number with an operational consequence: **a synchronous `SAVE` of 500,000
 entries blocks the connection that issued it for ~264 ms.** Other clients are
@@ -1472,9 +1474,13 @@ and expiry is only ever checked on an entry an operation is already holding.
 
 **Space: O(n)**, bounded by `capacity` once one is set. Per entry, roughly:
 the key twice (§12), the value once, two list pointers, and the map's node and
-bucket overhead. For a 16-byte key and a 64-byte value that is an estimated
-~180–200 bytes for ~80 bytes of payload. ⬜ *That figure is an estimate from the
-data layout, not a measurement; measuring it properly is Stage 11 work.*
+bucket overhead. For a 16-byte key and a 64-byte value this is **221 bytes
+measured** against ~80 bytes of payload — 2.76×. See Performance Evaluation.
+
+*(This was carried as an estimate of "~180–200 bytes" from Stage 3 until Stage 9
+measured it. The layout calculation was too low, mostly because it did not
+account for the allocator's per-allocation bookkeeping across two nodes per
+entry.)*
 
 A caveat that matters more than the table: **every operation here is O(1), and
 they still differ by roughly 10× in measured cost** (§13). The constant factors —
@@ -1652,7 +1658,7 @@ on another day.
 
 ### What is deliberately not measured yet
 
-- **Memory footprint per entry.** ⬜ Stage 11. The figure in §6 is an estimate from the layout, not a measurement.
+- ~~Memory footprint per entry~~ — ✅ measured in Stage 9: **221 bytes/entry**.
 - **Concurrency scaling.** ⬜ Stage 8.
 - **TTL expiry cost.** ⬜ Stage 4.
 - **Latency below the clock tick.** ⬜ Stage 5, as above.
@@ -1886,7 +1892,7 @@ documented and well understood.
 
 **Against it:**
 
-- **Memory overhead is high** — an estimated ~180–200 bytes per entry for ~80 bytes of payload. Two node allocations per entry (list node and map node), plus the key stored twice, plus bucket overhead. Redis avoids much of this with *approximated* LRU: it samples a handful of random keys and evicts the oldest of the sample, which needs no list at all.
+- **Memory overhead is high** — **221 bytes per entry, measured**, for ~80 bytes of payload (2.76×). Two node allocations per entry (list node and map node), plus the key stored twice, plus bucket overhead. Redis avoids much of this with *approximated* LRU: it samples a handful of random keys and evicts the oldest of the sample, which needs no list at all.
 - **Poor cache locality.** Both containers are node-based, so a `get` chases pointers through scattered memory. The benchmark shows this clearly: `SET update` costs ~3.5× `SET insert` despite doing strictly less work, purely because of access patterns.
 - **Every read is a write.** A `get` mutates the list. That is free today and becomes a real problem in Stage 8: readers cannot share a read-lock if they all need to reorder, which is exactly why LRU is hard to make concurrent and why sharding (Stage 9) matters.
 - **O(1) is average, not worst case.** Adversarial keys colliding in one bucket degrade lookups to O(n). CacheX assumes a trusted network.
@@ -2353,23 +2359,29 @@ Thread counts 1 / 2 / 4 / 8 / 16 for B and C; A is single-threaded.
 - **All threads released by a start gate**, so an N-thread run genuinely has N threads in flight rather than a staggered ramp.
 - **Throughput from wall time** of the whole run, so it is not limited by clock resolution. **Latency percentiles are quantised to the 41 ns tick**; operations here take 130–900 ns, so p50/p95/p99 are accurate to roughly one tick and sub-tick differences are invisible.
 - **Hit ratio, eviction count and error count are exact** and identical across versions for a given workload (≈78.95% and ≈44,200 evictions for `read-heavy`), which is the check that the workloads really are identical.
+- **Every figure below is the median of 5 captured runs**, with the range given where it is wide. The raw output of those runs is committed in `benchmarks/results/`, alongside `environment.txt` recording the machine, commit and load average. `benchmarks/run_all.sh` regenerates all of it.
+- **A discarded warm-up pass runs before each workload.** Without it, whichever version ran first absorbed the cost of faulting in that workload's pages and growing the allocator — and that was always A, which made the *unlocked* baseline measure slower than the mutex version at one thread. An impossible result, and purely an artefact of ordering. It was caught by noticing that A < B at one thread, which cannot happen when B does strictly more work.
 - Zero errors in every configuration reported here.
 
 ## Results — `read-heavy` (representative)
 
-| version | threads | ops/sec | avg ns | p50 | p95 | p99 | hit % | evictions | errors |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| A baseline | 1 | 5,972,259 | 167.4 | 125 | 333 | 375 | 78.95 | 44,219 | 0 |
-| B mutex | 1 | 5,758,406 | 173.7 | 125 | 333 | 417 | 78.95 | 44,219 | 0 |
-| B mutex | 2 | 3,106,827 | 321.9 | 125 | 1,583 | 11,333 | 78.96 | 44,171 | 0 |
-| B mutex | 4 | 1,512,163 | 661.3 | 209 | 13,625 | 30,125 | 78.99 | 44,118 | 0 |
-| B mutex | 8 | 1,938,144 | 516.0 | 250 | 12,208 | 38,625 | 78.95 | 44,163 | 0 |
-| B mutex | 16 | 1,844,622 | 542.1 | 250 | 16,667 | 134,333 | 78.92 | 44,308 | 0 |
-| C sharded | 1 | 5,119,607 | 195.3 | 125 | 375 | 458 | 78.96 | 44,191 | 0 |
-| C sharded | 2 | 3,445,859 | 290.2 | 209 | 3,084 | 5,167 | 78.96 | 44,205 | 0 |
-| C sharded | 4 | 3,336,444 | 299.7 | 333 | 6,000 | 11,791 | 78.98 | 44,176 | 0 |
-| C sharded | 8 | 2,961,442 | 337.7 | 417 | 14,917 | 27,292 | 78.97 | 44,179 | 0 |
-| C sharded | 16 | 2,719,595 | 367.7 | 500 | 34,459 | 62,458 | 78.91 | 44,374 | 0 |
+| version | threads | ops/sec (median) | range | p50 | p95 | p99 | hit % |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| A baseline | 1 | **6,039,943** | 4.62 M – 6.09 M | 125 | 333 | 375 | 78.95 |
+| B mutex | 1 | 5,049,065 | 4.09 M – 5.67 M | 125 | 375 | 541 | 78.95 |
+| B mutex | 2 | 2,417,427 | 2.01 M – 2.51 M | 167 | 2,584 | 14,916 | 78.96 |
+| B mutex | 4 | 1,079,059 | 1.02 M – 1.20 M | 375 | 19,541 | 46,458 | 78.98 |
+| B mutex | 8 | 1,657,196 | 1.49 M – 1.89 M | 292 | 15,625 | 50,542 | 78.96 |
+| B mutex | 16 | 1,880,650 | 1.69 M – 2.02 M | 250 | 14,875 | 91,625 | 78.94 |
+| C sharded | 1 | 5,091,112 | 3.71 M – 5.17 M | 125 | 375 | 459 | 78.96 |
+| C sharded | 2 | 3,226,120 | 2.82 M – 3.54 M | 250 | 3,167 | 5,750 | 78.96 |
+| C sharded | 4 | 3,152,839 | 2.97 M – 3.43 M | 333 | 6,208 | 12,750 | 78.98 |
+| C sharded | 8 | 2,956,268 | 2.81 M – 3.23 M | 417 | 14,917 | 27,834 | 78.97 |
+| C sharded | 16 | 2,765,883 | 2.74 M – 2.91 M | 500 | 34,833 | 62,542 | 78.91 |
+
+Zero errors and ~44,200 evictions in every row. Hit rate spans 78.91–78.98%
+across all eleven configurations and all five runs — the check that every version
+really did receive the identical workload.
 
 The other four workloads follow the same shape; the full tables are the suite's
 own output.
@@ -2378,26 +2390,26 @@ own output.
 
 | workload | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| read-heavy | −11.1% | +10.9% | **+120.6%** | +52.8% | +47.4% |
-| balanced | −11.4% | −6.9% | **+159.6%** | +62.2% | +55.6% |
-| write-heavy | −7.6% | +16.7% | **+208.1%** | +82.1% | +63.0% |
-| high-churn | +1.1% | +14.0% | **+194.8%** | +45.2% | +49.1% |
-| ttl-heavy | −5.1% | +31.0% | **+275.2%** | +57.6% | +46.3% |
+| read-heavy | −8.8% | +28.6% | **+174.9%** | +69.3% | +46.9% |
+| balanced | −13.1% | +16.3% | **+197.0%** | +56.2% | +57.1% |
+| write-heavy | −8.3% | +22.1% | **+178.7%** | +94.1% | +67.0% |
+| high-churn | −11.0% | +29.1% | **+197.7%** | +67.1% | +35.9% |
+| ttl-heavy | −4.3% | +44.5% | **+234.6%** | +66.4% | +57.0% |
 
 ### C vs B at matched thread counts — p99 latency (negative is better)
 
 | workload | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| read-heavy | +9.8% | −54.4% | **−60.9%** | −29.3% | −53.5% |
-| balanced | +10.1% | −43.8% | **−70.7%** | −39.5% | −49.1% |
-| write-heavy | +19.9% | −59.1% | **−74.3%** | −49.1% | −59.1% |
-| high-churn | −36.9% | −58.4% | **−73.7%** | −30.7% | −69.7% |
-| ttl-heavy | +0.2% | −60.1% | **−78.2%** | −36.1% | −56.2% |
+| read-heavy | +9.8% | −59.5% | **−69.3%** | −36.7% | −33.1% |
+| balanced | +13.3% | −55.8% | **−72.7%** | −32.8% | −46.8% |
+| write-heavy | +9.8% | −60.4% | **−69.6%** | −54.4% | −68.8% |
+| high-churn | +13.3% | −66.8% | **−75.2%** | −49.5% | −62.2% |
+| ttl-heavy | +9.2% | −62.1% | **−76.1%** | −38.6% | −56.4% |
 
 ## The result that matters most, and it is not flattering
 
 **No multi-threaded configuration beats the single-threaded baseline.** A at one
-thread (5.97 M ops/sec on `read-heavy`) is the fastest row in the table. Every
+thread (6.04 M ops/sec median on `read-heavy`) is the fastest row in the table. Every
 version gets *slower* as threads are added.
 
 That is not a bug, and it is not fixed by better locking. A cache operation here
@@ -2408,8 +2420,8 @@ positive.
 
 So the honest framing of sharding's value is:
 
-- **Against the single global mutex at the same thread count, it is decisively better** — up to +275% throughput and −78% p99 at 4 threads.
-- **At one thread it is 5–11% slower**, because it adds a hash and an indirection and removes contention that was not there.
+- **Against the single global mutex at the same thread count, it is decisively better** — +175% to +235% throughput and −69% to −76% p99 at 4 threads.
+- **At one thread it is 4–13% slower**, because it adds a hash and an indirection and removes contention that was not there.
 - **It does not make the cache scale.** Nothing here does.
 
 The system-level reason threads exist at all is not cache throughput — it is that
@@ -2483,16 +2495,22 @@ a copy (§12) is weakened.
 **Before / after** — same workload, same cache, single-threaded so no contention
 is mixed in:
 
-| variant | ops/sec | avg ns | p50 | p99 |
-| --- | ---: | ---: | ---: | ---: |
-| `get()` | 5,438,357 | 183.9 | 125 | 458 |
-| `get_into()` | 7,937,893 | 126.0 | 83 | 375 |
+| variant | ops/sec (median of 5) | range | avg ns | p50 |
+| --- | ---: | --- | ---: | ---: |
+| `get()` | 5,118,081 | 4.47 M – 5.41 M | 195.4 | 125 |
+| `get_into()` | **7,634,589** | 6.05 M – 7.85 M | 131.0 | 83 |
 
-**+46.0% throughput**, avg latency 184 ns → 126 ns, p50 125 → 83 ns.
+**Median +45.3% throughput**, avg latency 195 ns → 131 ns, p50 125 ns → 83 ns.
 
-Across runs the improvement measured **+42.3%, +46.0%, +73.2% and +99.7%** — the
-larger figures come from runs where the machine was busier and both numbers were
-lower, so the *ratio* inflated. **The defensible claim is the low end: ~+42%.**
+The per-run improvement ranged from **+18.2% to +72.9%** across the five captured
+runs. That spread is machine noise, not a property of the change: the two
+variants are measured back to back, and when the machine is busy the `get()`
+baseline sinks further than `get_into()` does, inflating the ratio.
+
+**The claim worth making is the median, +45%, with +18% as the floor actually
+observed.** An earlier draft of this section quoted +46% from a single
+unrecorded run — a number inside the range, but not reproducible from anything
+committed. Every figure here now comes from `benchmarks/results/bench_suite.*.txt`.
 
 **Why it is not wired into the server.** The measurements say it would not show
 up there. A TCP round trip is ~20 µs against a ~0.4 µs cache operation, so
@@ -2515,26 +2533,28 @@ in-process users, tested, and left there.
 
 # Resume-Ready Metrics
 
-Only figures that were actually measured, with the configuration they came from.
-Each is reproducible by running the named binary.
+Only figures that were actually measured. Each is the **median of 5 captured
+runs** unless stated otherwise, and the raw output is committed in
+`benchmarks/results/` — every number here can be found in a file. Regenerate with
+`benchmarks/run_all.sh`.
 
 **Throughput**
 
-- **5.97 M operations/sec** single-threaded on a 90/10 read-heavy workload (400k ops, 100k keys, 40k capacity, 78.95% hit rate) — `cachex_bench_suite`
-- **3.34 M operations/sec** at 4 threads with an 8-shard cache on the same workload
-- **~48,000 requests/sec** end-to-end over TCP with one client, and **~123,000 req/sec** at 16 concurrent clients — `cachex_net_bench`
+- **6.0 M operations/sec** single-threaded on a 90/10 read-heavy workload (400k ops, 100k keys, 40k capacity, 78.95% hit rate) — `cachex_bench_suite`
+- **3.2 M operations/sec** at 4 threads with an 8-shard cache on the same workload
+- **~48,000 requests/sec** end-to-end over TCP with one client, **~123,000 req/sec** at 16 concurrent clients — `cachex_net_bench`
 
-**Improvement from sharding (8 shards vs one global mutex, same workload, same thread count)**
+**Improvement from sharding** (8 shards vs one global mutex — same workload, same thread count)
 
-- **+120% to +275% throughput at 4 threads** across five workloads
-- **+45% to +82% throughput at 8 threads**
-- **−61% to −78% p99 latency at 4 threads**
-- **−29% to −50% p99 latency at 8 threads**
+- **+175% to +235% throughput at 4 threads** across five workloads
+- **+56% to +94% throughput at 8 threads**
+- **−69% to −76% p99 latency at 4 threads**
+- **−33% to −54% p99 latency at 8 threads**
 - **+232% throughput at 4 threads** on a pure `get()` microbenchmark (2.25 M → 7.48 M ops/sec) — `cachex_net_bench`
 
 **Improvement from profiling-driven optimisation**
 
-- **+42% throughput** from eliminating a per-hit heap allocation on the read path, identified by stack profiling (184 ns → 126 ns average latency, p50 125 ns → 83 ns) — `cachex_bench_suite`
+- **+45% throughput (median; +18% worst observed)** from eliminating a per-hit heap allocation on the read path, identified by stack profiling — average latency 195 ns → 131 ns, p50 125 ns → 83 ns — `cachex_bench_suite`
 
 **Latency**
 
@@ -2544,19 +2564,31 @@ Each is reproducible by running the named binary.
 
 **Cache behaviour**
 
-- **78.95% hit rate** on an 80/20 skewed workload at 40% capacity; **84.21% at 40% capacity** on the LRU sweep, against **3.32% at 1% capacity** — demonstrating LRU retains the working set
+- **78.95% hit rate** on an 80/20 skewed workload at 40% capacity — held to 78.91–78.98% across every version, thread count and run
+- **84.21% hit rate at 40% capacity vs 3.32% at 1%** on the LRU capacity sweep — LRU retaining the working set
 - **9.65% hit rate** under high churn (uniform keys, 10× capacity) — the honest floor when there is no locality to exploit
 - **0.02 percentage points** — the hit-rate cost of per-shard LRU versus global LRU
 - **Zero errors** across every benchmark configuration
 
 **Resource use**
 
-- **221 bytes/entry** measured (2.76× the 80-byte payload), stable from 250k to 500k entries
+- **221 bytes/entry** measured (2.76× the 80-byte payload) — identical in all 5 runs
 - **90 bytes/entry** on disk in a snapshot — ~2.5× smaller than in memory
 - **264 ms to save / 252 ms to load 500,000 entries** (42.9 MiB), scaling linearly at ~0.5 µs/entry
 
 **Scaling — stated honestly**
 
 - **2.6× throughput from 1 to 16 concurrent TCP clients**, limited by the transport rather than the cache (a lock-free `PING` control plateaus at the same point)
-- **In-process, concurrency does not improve throughput at all** on this hardware: the single-threaded baseline is the fastest configuration measured. Sharding's measured value is in beating the global mutex under concurrency, not in scaling past one thread.
+- **In-process, concurrency does not improve throughput at all** on this hardware: the single-threaded baseline is the fastest configuration measured. Sharding's measured value is beating the global mutex under concurrency, not scaling past one thread.
 
+**A note on how these were arrived at**
+
+Two measurement bugs were found and fixed while producing them, both by noticing
+an impossible result rather than by inspection:
+
+- Memory was first measured with RSS, which does not shrink when memory is freed; it reported **0 bytes/entry** for 100k entries. Switched to `malloc` bytes-in-use.
+- The suite measured version A first in each workload with no warm-up, so A absorbed the page-fault and allocator cost — making the *unlocked* baseline appear slower than the mutex version at one thread, which cannot be true.
+
+Single-run point values have been replaced throughout by medians over five
+captured runs, because this machine's memory-bound phases have been observed to
+swing by up to 2× between runs.

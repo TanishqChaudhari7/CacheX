@@ -1,0 +1,196 @@
+CacheX benchmark suite
+======================
+
+build        : Release
+compiler     : AppleClang 21.0.0.21000101
+hw threads   : 12
+seed         : 20260911 (fixed; every version replays the identical operation sequence)
+operations   : 400000 per workload
+value size   : 64 bytes
+shards (C)   : 8
+clock        : steady_clock, overhead 24.4 ns/read, tick 41.0 ns
+
+  NOTE: per-operation latencies are quantised to the 41.0 ns clock tick.
+  Operations here take a few hundred ns, so p50/p95/p99 are
+  accurate to roughly one tick. ops/sec and avg ns come from the
+  wall time of the whole run and are not tick-limited.
+
+
+WORKLOAD: read-heavy
+90% GET / 10% SET, skewed keys
+key space 100000, capacity 40000, cache-aside on
+
+version     threads          ops     ops/sec    avg ns      p50      p95      p99    hit %  evictions   errors
+--------------------------------------------------------------------------------------------------------------
+A baseline  1             400000     4970588     201.2      125      375      625    78.95      44219        0
+B mutex     1             400000     4919913     203.3      125      375      541    78.95      44219        0
+B mutex     2             400000     2257841     442.9      208     2000    17667    78.97      44158        0
+B mutex     4             400000     1015823     984.4      417    21042    48500    78.97      44191        0
+B mutex     8             400000     1494817     669.0      334    19250    64542    78.95      44247        0
+B mutex     16            400000     1686740     592.9      292    16083   117542    78.94      44249        0
+C sharded   1             400000     3708643     269.6      167      500      750    78.96      44191        0
+C sharded   2             400000     2824610     354.0      250     3500     7166    78.96      44177        0
+C sharded   4             400000     3428758     291.7      291     6041    12625    78.98      44144        0
+C sharded   8             400000     3227882     309.8      375    14333    27167    78.97      44156        0
+C sharded   16            400000     2906687     344.0      458    34000    61458    78.91      44379        0
+
+
+WORKLOAD: balanced
+50% GET / 50% SET, skewed keys
+key space 100000, capacity 40000, cache-aside on
+
+version     threads          ops     ops/sec    avg ns      p50      p95      p99    hit %  evictions   errors
+--------------------------------------------------------------------------------------------------------------
+A baseline  1             400000     4132004     242.0      125      458      916    78.93      44219        0
+B mutex     1             400000     4098219     244.0      167      459      750    78.93      44219        0
+B mutex     2             400000     2265601     441.4      208     2209    16417    78.96      44161        0
+B mutex     4             400000     1130832     884.3      375    18458    44167    78.93      44155        0
+B mutex     8             400000     1794778     557.2      333    15375    50750    78.94      44205        0
+B mutex     16            400000     1733241     577.0      333    19833   159750    78.91      44297        0
+C sharded   1             400000     2873862     348.0      250      625      917    78.93      44191        0
+C sharded   2             400000     3391924     294.8      208     2959     6125    78.96      44189        0
+C sharded   4             400000     3939368     253.8      250     5583    11875    78.91      44140        0
+C sharded   8             400000     3056877     327.1      417    14791    29167    78.92      44183        0
+C sharded   16            400000     2760714     362.2      542    35542    64500    78.93      44362        0
+
+
+WORKLOAD: write-heavy
+10% GET / 90% SET, skewed keys
+key space 100000, capacity 40000, cache-aside on
+
+version     threads          ops     ops/sec    avg ns      p50      p95      p99    hit %  evictions   errors
+--------------------------------------------------------------------------------------------------------------
+A baseline  1             400000     5259752     190.1      125      333      459    79.25      44219        0
+B mutex     1             400000     4044771     247.2      167      459      833    79.25      44219        0
+B mutex     2             400000     1583099     631.7      292     3959    21916    79.16      44187        0
+B mutex     4             400000      855794    1168.5      667    25209    58666    79.20      44130        0
+B mutex     8             400000     1613966     619.6      375    16666    57416    79.19      44183        0
+B mutex     16            400000     1732643     577.2      334    15208   129833    79.32      44273        0
+C sharded   1             400000     4713590     212.2      166      375      500    79.25      44191        0
+C sharded   2             400000     4355381     229.6      167     1791     4500    79.14      44172        0
+C sharded   4             400000     3797812     263.3      250     5667    12042    79.23      44142        0
+C sharded   8             400000     3132356     319.2      458    14375    26208    79.28      44165        0
+C sharded   16            400000     2609469     383.2      583    37125    70666    79.27      44386        0
+
+
+WORKLOAD: high-churn
+20% GET / 80% SET, uniform over 10x capacity
+key space 200000, capacity 20000, cache-aside on
+
+version     threads          ops     ops/sec    avg ns      p50      p95      p99    hit %  evictions   errors
+--------------------------------------------------------------------------------------------------------------
+A baseline  1             400000     3463758     288.7      250      375      458     9.65     341190        0
+B mutex     1             400000     3357591     297.8      291      375      459     9.65     341190        0
+B mutex     2             400000     1621967     616.5      333     4500    20959     9.79     340922        0
+B mutex     4             400000      714018    1400.5      792    28166    57958     9.81     341127        0
+B mutex     8             400000     1178608     848.5      458    21292    67875     9.66     341367        0
+B mutex     16            400000     1223801     817.1      500    28042   235750     9.72     340954        0
+C sharded   1             400000     2848393     351.1      292      459      667     9.65     341172        0
+C sharded   2             400000     2555726     391.3      375     3458     6125     9.78     340959        0
+C sharded   4             400000     2840786     352.0      417     6333    13000     9.77     341171        0
+C sharded   8             400000     2102607     475.6      792    18083    34250     9.72     341281        0
+C sharded   16            400000     1845198     541.9     1041    42000    75250     9.72     341070        0
+
+
+WORKLOAD: ttl-heavy
+70% GET / 30% SET, every SET carries a 2s TTL
+key space 100000, capacity 40000, cache-aside on
+
+version     threads          ops     ops/sec    avg ns      p50      p95      p99    hit %  evictions   errors
+--------------------------------------------------------------------------------------------------------------
+A baseline  1             400000     4506065     221.9      125      417      709    78.97      44219        0
+B mutex     1             400000     4181613     239.1      167      417      708    78.97      44219        0
+B mutex     2             400000     2557619     391.0      167     1834    13750    78.97      44175        0
+B mutex     4             400000     1002950     997.1      458    21000    52167    78.96      44157        0
+B mutex     8             400000     1942039     514.9      291    12541    39041    78.93      44237        0
+B mutex     16            400000     1815641     550.8      292    16584   138458    78.98      44242        0
+C sharded   1             400000     4235671     236.1      167      417      625    78.98      44191        0
+C sharded   2             400000     4393106     227.6      167     1791     4292    78.97      44163        0
+C sharded   4             400000     4027298     248.3      250     5375    11167    78.96      44179        0
+C sharded   8             400000     3230789     309.5      375    14125    26500    78.93      44195        0
+C sharded   16            400000     2850482     350.8      459    34000    60375    78.93      44373        0
+
+
+VERSION COMPARISON
+==================
+B and C at their best thread count, against the single-threaded
+baseline and against each other.
+
+workload          A (1 thr)       B best      at       C best      at      C vs B      C vs A
+---------------------------------------------------------------------------------------------
+read-heavy          4970588      4919913     1t      3708643     1t      -24.6%      -25.4%
+balanced            4132004      4098219     1t      3939368     4t       -3.9%       -4.7%
+write-heavy         5259752      4044771     1t      4713590     1t      +16.5%      -10.4%
+high-churn          3463758      3357591     1t      2848393     1t      -15.2%      -17.8%
+ttl-heavy           4506065      4181613     1t      4393106     2t       +5.1%       -2.5%
+
+
+C vs B AT MATCHED THREAD COUNTS (throughput)
+===========================================
+The fair comparison for the sharding question: same workload,
+same number of threads, only the locking strategy differs.
+
+workload         1 thread  2 threads  4 threads  8 threads 16 threads
+---------------------------------------------------------------------
+read-heavy         -24.6%     +25.1%    +237.5%    +115.9%     +72.3%
+balanced           -29.9%     +49.7%    +248.4%     +70.3%     +59.3%
+write-heavy        +16.5%    +175.1%    +343.8%     +94.1%     +50.6%
+high-churn         -15.2%     +57.6%    +297.9%     +78.4%     +50.8%
+ttl-heavy           +1.3%     +71.8%    +301.5%     +66.4%     +57.0%
+
+
+p99 LATENCY, B vs C at each thread count (ns)
+=============================================
+
+workload           1t B     1t C     2t B     2t C     4t B     4t C     8t B     8t C    16t B    16t C
+--------------------------------------------------------------------------------------------------------
+read-heavy          541      750    17667     7166    48500    12625    64542    27167   117542    61458
+balanced            750      917    16417     6125    44167    11875    50750    29167   159750    64500
+write-heavy         833      500    21916     4500    58666    12042    57416    26208   129833    70666
+high-churn          459      667    20959     6125    57958    13000    67875    34250   235750    75250
+ttl-heavy           708      625    13750     4292    52167    11167    39041    26500   138458    60375
+
+p99 reduction, C against B at the same thread count:
+
+workload         1 thread  2 threads  4 threads  8 threads 16 threads
+---------------------------------------------------------------------
+read-heavy         +38.6%     -59.4%     -74.0%     -57.9%     -47.7%
+balanced           +22.3%     -62.7%     -73.1%     -42.5%     -59.6%
+write-heavy        -40.0%     -79.5%     -79.5%     -54.4%     -45.6%
+high-churn         +45.3%     -70.8%     -77.6%     -49.5%     -68.1%
+ttl-heavy          -11.7%     -68.8%     -78.6%     -32.1%     -56.4%
+
+  Negative is better: C's p99 is lower than B's by that much.
+
+
+MEMORY PER ENTRY (measured, not estimated)
+==========================================
+
+entries           heap delta     bytes/entry      vs payload
+------------------------------------------------------------
+100000                20.6 MiB           216.4           2.70x
+250000                52.7 MiB           221.2           2.76x
+500000               105.5 MiB           221.2           2.76x
+
+  payload (16-byte key + 64-byte value) = 80 bytes/entry.
+  Measured as malloc bytes-in-use before and after building the
+  cache, so it covers the two node allocations per entry, the
+  value's heap buffer, the duplicated key and the bucket array --
+  everything the data structure asks the allocator for. It does
+  not include allocator slack within a size class, so the true
+  cost to the process is somewhat higher.
+
+
+OPTIMISATION: get() vs get_into()
+=================================
+Single-threaded, read-heavy workload, 64-byte values.
+get() allocates a std::string per hit; get_into() reuses one buffer.
+
+variant               ops/sec     avg ns       p50       p99    heap bytes
+--------------------------------------------------------------------------
+get()                 4468546      223.8       125       667       8745984
+get_into()            7724077      129.5        83       375       8746064
+
+  throughput change: +72.9%
+
+checksum: 579413008  (printed only so the optimiser cannot discard the work)

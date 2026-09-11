@@ -1,0 +1,118 @@
+CacheX 0.1.0 benchmark
+=================================
+
+build          : Release
+compiler       : AppleClang 21.0.0.21000101
+key size       : 16 bytes (fits small-string storage)
+value size     : 64 bytes (heap allocated)
+seed           : 42
+clock          : std::chrono::steady_clock, measured overhead 24.3 ns/read, tick 41.0 ns
+
+
+1. CORE OPERATIONS (unbounded cache -- Stage 2 baseline)
+   200000 ops per phase, median of 5 after a discarded warm-up
+
+phase                ops  total (ms)       ops/sec    avg (ns)
+--------------------------------------------------------------
+SET insert        200000       30.68       6518816       153.4
+SET update        200000      140.15       1427000       700.8
+GET hit           200000       94.77       2110334       473.9
+GET miss          200000        9.34      21415952        46.7
+CONTAINS          200000       20.32       9844336       101.6
+ERASE             200000       72.48       2759326       362.4
+
+
+2. COST OF LRU (identical request sequence, interleaved)
+   uniform 50% GET / 50% SET over 100000 keys, 200000 requests, 15 interleaved repeats
+
+configuration                            ops/sec    avg (ns)    evictions
+-------------------------------------------------------------------------
+unbounded (no LRU)                       8912739       112.2            0
+bounded, capacity = key space            8477016       118.0            0
+bounded, capacity = 10% of keys          6818366       146.7        80196
+
+  Rows 1 and 2 do identical work; row 2 additionally performs the
+  capacity check on every insert. Paired per-repeat comparison over 15 repeats:
+    median +0.6%   middle half -0.2% to +6.7%   full range -16.9% to +21.0%
+  The interval straddles zero, so the overhead is below this
+  harness's noise floor -- the expected result for one predictable
+  branch per insert. That is NOT a claim that LRU is free; it means
+  this experiment cannot resolve a cost this small.
+  (Row 3 is not comparable -- it holds far less data, so its
+   memory access pattern differs as well as its work.)
+
+
+3. WORKLOAD A -- mostly hits (90% GET / 10% SET, cache-aside)
+   80/20 skewed keys over 100000, capacity = 40% of key space
+   measured at steady state: one full warm-up pass is discarded
+
+  requests   : 200000  (179882 GET, 20118 SET)
+  throughput : 6831204 ops/sec (146.4 ns/op per application request)
+  hit rate   : 84.21%  (151475 hits, 28407 misses)
+  fills      : 28407 (cache-aside populations on miss)
+  evictions  : 31495,  entries resident: 40000
+
+  latency (ns)    samples       mean       p50       p95       p99         max
+  ----------------------------------------------------------------------------
+  GET              179882       96.0      84.0     167.0     208.0     14500.0
+  SET               48525      215.0     209.0     334.0     416.0     14541.0
+  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+   clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
+
+
+4. WORKLOAD B -- heavy churn (20% GET / 80% SET, cache-aside)
+   uniform keys over 100000, capacity = 5% of key space, so most inserts evict
+   no hot set to retain, so this is the worst case for LRU
+
+  requests   : 200000  (40085 GET, 159915 SET)
+  throughput : 4536047 ops/sec (220.5 ns/op per application request)
+  hit rate   : 4.92%  (1971 hits, 38114 misses)
+  fills      : 38114 (cache-aside populations on miss)
+  evictions  : 189939,  entries resident: 5000
+
+  latency (ns)    samples       mean       p50       p95       p99         max
+  ----------------------------------------------------------------------------
+  GET               40085       74.4      83.0     166.0     250.0     11959.0
+  SET              198029      222.7     208.0     333.0     459.0     16666.0
+  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+   clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
+
+
+5. HIT RATE vs CAPACITY (Workload A request sequence)
+
+capacity                  hit rate     evictions       ops/sec
+--------------------------------------------------------------
+1%    (1000 entries)         3.32%        193372       5336049
+5%    (5000 entries)        15.92%        168125       4030700
+10%   (10000 entries)       30.92%        138149       4002482
+20%   (20000 entries)       57.78%         84385       4935377
+40%   (40000 entries)       84.21%         31495       6866157
+100%  (100000 entries)     100.00%             0      10704394
+
+
+6. COST OF TTL CHECKS
+   100000 GET hits over a shuffled order, paired and
+   order-alternated, 15 repeats
+
+case                                 ops/sec    avg (ns)     reclaimed
+----------------------------------------------------------------------
+a) GET hit, no TTL                   2600332       384.6             0
+b) GET hit, TTL set                  2808289       356.1             0
+c) GET, all entries expired          1696004       589.6        100000
+
+  Cost of the check itself -- (b) against (a), paired per repeat:
+    median +0.2%   middle half -15.1% to +20.8%   full range -37.7% to +78.6%
+  Case (c) is a different path, not merely a slower one: those
+  gets return nothing and delete an entry, so it is not
+  comparable to (a) or (b). It is reported to show what a sea of
+  expired entries costs to walk through once.
+
+  latency (ns)    samples       mean       p50       p95       p99         max
+  ----------------------------------------------------------------------------
+  no TTL           100000      497.1     416.0     917.0    3666.0     73958.0
+  TTL set          100000      340.2     291.0     667.0    1000.0     14792.0
+  expired          100000      523.1     416.0    1041.0    3625.0     16417.0
+  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+   clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
+
+checksum: 536627648  (printed only so the optimiser cannot discard the work)

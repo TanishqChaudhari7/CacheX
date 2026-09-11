@@ -1,0 +1,44 @@
+CacheX persistence benchmark
+============================
+
+build        : Release
+compiler     : AppleClang 21.0.0.21000101
+key size     : 16 bytes
+value size   : 64 bytes
+shards       : 8
+repeats      : 5, median reported
+storage      : /tmp on this machine's filesystem
+
+Entries without a TTL
+
+entries        save (ms)   load (ms) save us/entry  snapshot KiB   bytes/entry
+------------------------------------------------------------------------------
+1000                0.68        0.50         0.676          87.9          90.0
+10000               4.08        4.61         0.408         878.9          90.0
+100000             47.17       47.15         0.472        8789.1          90.0
+500000            296.45      242.03         0.593       43945.4          90.0
+
+Entries with a TTL
+
+entries        save (ms)   load (ms) save us/entry  snapshot KiB   bytes/entry
+------------------------------------------------------------------------------
+1000                0.67        0.60         0.672          92.8          95.0
+10000               5.65        5.62         0.565         927.8          95.0
+100000             50.49       56.44         0.505        9277.4          95.0
+500000            313.31      288.51         0.627       46386.8          95.0
+
+
+SNAPSHOT SIZE vs IN-MEMORY SIZE
+
+  payload (key + value)        : 80 bytes/entry
+  snapshot                     : 90.0 bytes/entry (1.13x payload)
+  in memory (estimated)        : ~180-200 bytes/entry (2.4x payload)
+
+  The snapshot is far smaller than the live cache because it
+  stores only the data. The hash map's buckets and nodes, both
+  list pointers, the duplicated key and the allocator's overhead
+  all exist to make lookups O(1) -- none of that is worth writing
+  down, because loading rebuilds it.
+
+  The in-memory figure is an estimate from the data layout, not
+  a measurement -- see ARCHITECTURE.md.
