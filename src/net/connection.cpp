@@ -18,7 +18,7 @@ constexpr std::size_t kReadChunkBytes = 16 * 1024;
 
 }  // namespace
 
-Connection::Connection(Socket socket, SyncCache& cache)
+Connection::Connection(Socket socket, ShardedCache& cache)
     : socket_(std::move(socket)), cache_(cache) {}
 
 bool Connection::fill_buffer() {

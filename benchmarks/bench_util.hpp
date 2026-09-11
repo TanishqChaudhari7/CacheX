@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -118,5 +119,50 @@ inline void print_latency_row(const char* label, const Latency& l) {
             << l.mean << std::setw(10) << l.p50 << std::setw(10) << l.p95
             << std::setw(10) << l.p99 << std::setw(12) << l.max << "\n";
 }
+
+enum class Op : std::uint8_t { Get, Set };
+
+struct Request {
+  Op op;
+  std::uint32_t key;
+};
+
+/// Builds the entire request sequence up front, outside every timed region, so
+/// that RNG cost is never measured and the sequence is byte-identical between
+/// runs and between cache configurations. Replaying one fixed sequence is what
+/// makes the A/B comparison in section 2 valid.
+///
+/// `skewed` models real traffic: 80% of requests go to the hottest 20% of keys.
+/// Uniform access is the pessimistic case for a cache -- there is no hot set to
+/// retain, so eviction cannot help.
+inline std::vector<Request> make_workload(std::size_t ops, std::size_t key_space,
+                                   int get_percent, bool skewed,
+                                   std::uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> roll(1, 100);
+  std::uniform_int_distribution<std::uint32_t> any_key(
+      0, static_cast<std::uint32_t>(key_space - 1));
+
+  const std::size_t hot = std::max<std::size_t>(1, key_space / 5);
+  std::uniform_int_distribution<std::uint32_t> hot_key(
+      0, static_cast<std::uint32_t>(hot - 1));
+  std::uniform_int_distribution<std::uint32_t> cold_key(
+      static_cast<std::uint32_t>(hot), static_cast<std::uint32_t>(key_space - 1));
+
+  std::vector<Request> requests;
+  requests.reserve(ops);
+  for (std::size_t i = 0; i < ops; ++i) {
+    const Op op = roll(rng) <= get_percent ? Op::Get : Op::Set;
+    std::uint32_t key = 0;
+    if (!skewed || hot >= key_space) {
+      key = any_key(rng);
+    } else {
+      key = roll(rng) <= 80 ? hot_key(rng) : cold_key(rng);
+    }
+    requests.push_back(Request{op, key});
+  }
+  return requests;
+}
+
 
 }  // namespace bench

@@ -12,7 +12,8 @@
 #include <vector>
 
 #include "bench_util.hpp"
-#include "cachex/sync_cache.hpp"
+#include "cachex/sharded_cache.hpp"
+#include <iterator>
 #include "cachex/line_buffer.hpp"
 #include "cachex/server.hpp"
 #include "cachex/socket.hpp"
@@ -28,6 +29,18 @@ constexpr std::size_t kRequests = 20000;  // per phase, single-client section
 // the same total work and the throughputs are directly comparable.
 constexpr std::size_t kTotalRequests = 32000;
 constexpr int kClientCounts[] = {1, 2, 4, 8, 16};
+// Version A / B / C / D from the benchmark plan.
+constexpr std::size_t kShardCounts[] = {1, 2, 4, 8};
+
+// The in-process runs need far more work than the networked ones: without a
+// ~20 us round trip per request they finish in milliseconds, which is too short
+// to measure reliably.
+constexpr std::size_t kInProcessOps = 600000;
+
+// Key space for the skewed hit-rate comparison.
+constexpr std::size_t kKeySpaceForSkew = 100000;
+constexpr std::size_t kSkewWorkloadOps = 200000;
+constexpr std::uint32_t kSeed = 42;  // fixed, so the workload is reproducible
 constexpr std::size_t kValueBytes = 64;
 
 /// A blocking, one-request-at-a-time client -- no pipelining, no concurrency.
@@ -244,7 +257,7 @@ int main() {
   // benchmark a single self-contained binary and removes any question of which
   // build of the server is being measured -- but it does mean the numbers
   // include no real network, only the loopback path through the kernel.
-  cachex::SyncCache cache;
+  cachex::ShardedCache cache{1};
   cachex::Server::Options options;
   options.port = 0;  // let the OS pick a free port
   options.verbose = false;
@@ -323,150 +336,298 @@ int main() {
   }  // the single client disconnects here
 
   // ======================================================================
-  // Concurrency scaling. Every configuration performs the same total work, so
-  // throughput is directly comparable and the scaling factor is meaningful.
+  // Sharding matrix. Every configuration replays the identical workload; the
+  // only thing that changes is the shard count and the client count.
   // ======================================================================
   {
     const std::string value(kValueBytes, 'v');
 
-    // Pre-populate so the GET phase hits. Done before any timing.
-    for (std::size_t i = 0; i < kTotalRequests; ++i) {
-      cache.set(pad_key(i), value);
-    }
+    struct Cell {
+      double throughput = 0.0;
+      double p50 = 0.0;
+      double p95 = 0.0;
+      double p99 = 0.0;
+    };
+    // [shard configuration][client count]
+    using Matrix = std::vector<std::vector<Cell>>;
 
-    const auto run_scaling = [&](const char* name,
-                                 const std::function<std::string(int, std::size_t)>&
-                                     make_command) {
-      std::cout << "\n" << name << " -- " << kTotalRequests
-                << " total requests, split across N clients\n\n"
-                << std::left << std::setw(9) << "clients" << std::right
-                << std::setw(11) << "per client" << std::setw(13) << "req/sec"
-                << std::setw(10) << "scaling" << std::setw(11) << "p50 (us)"
-                << std::setw(10) << "p95" << std::setw(10) << "p99"
-                << std::setw(11) << "errors" << "\n"
-                << std::string(84, '-') << "\n";
+    const auto measure_matrix =
+        [&](const std::function<std::string(int, std::size_t)>& make_command,
+            bool prepopulate) {
+          Matrix matrix;
+          for (const std::size_t shards : kShardCounts) {
+            // A fresh cache and a fresh server per shard count, so no state
+            // carries over between configurations.
+            cachex::ShardedCache sharded(shards);
+            if (prepopulate) {
+              for (std::size_t i = 0; i < kTotalRequests; ++i) {
+                sharded.set(pad_key(i), value);
+              }
+            }
+            cachex::Server::Options opts;
+            opts.port = 0;
+            opts.verbose = false;
+            cachex::Server shard_server(sharded, opts);
+            std::string err;
+            if (!shard_server.start(err)) {
+              std::cerr << "benchmark: " << err << "\n";
+              return matrix;
+            }
+            std::thread shard_thread([&shard_server] { shard_server.run(); });
 
-      double baseline = 0.0;
-      for (const int clients : kClientCounts) {
-        const std::size_t per_client =
-            kTotalRequests / static_cast<std::size_t>(clients);
-        const ConcurrentResult result =
-            run_concurrent(server.bound_port(), clients, per_client, make_command);
+            std::vector<Cell> row;
+            for (const int clients : kClientCounts) {
+              const std::size_t per_client =
+                  kTotalRequests / static_cast<std::size_t>(clients);
+              const ConcurrentResult r = run_concurrent(
+                  shard_server.bound_port(), clients, per_client, make_command);
+              Cell cell;
+              cell.throughput = bench::ops_per_sec(r.wall, r.requests);
+              cell.p50 = r.latency.p50 / 1000.0;
+              cell.p95 = r.latency.p95 / 1000.0;
+              cell.p99 = r.latency.p99 / 1000.0;
+              row.push_back(cell);
+            }
+            matrix.push_back(row);
 
-        const double throughput = bench::ops_per_sec(result.wall, result.requests);
-        if (clients == kClientCounts[0]) {
-          baseline = throughput;
+            shard_server.stop();
+            shard_thread.join();
+          }
+          return matrix;
+        };
+
+    const auto print_matrix = [&](const char* title, const Matrix& matrix) {
+      if (matrix.empty()) {
+        return;
+      }
+      std::cout << "\n" << title << " -- throughput (req/sec)\n\n"
+                << std::left << std::setw(10) << "clients" << std::right;
+      for (const std::size_t shards : kShardCounts) {
+        std::cout << std::setw(13) << (std::to_string(shards) + " shard" +
+                                       (shards == 1 ? "" : "s"));
+      }
+      std::cout << std::setw(16) << "best vs 1" << "\n"
+                << std::string(10 + 13 * std::size(kShardCounts) + 16, '-') << "\n";
+
+      for (std::size_t c = 0; c < std::size(kClientCounts); ++c) {
+        std::cout << std::left << std::setw(10) << kClientCounts[c] << std::right;
+        double best = 0.0;
+        for (std::size_t s = 0; s < matrix.size(); ++s) {
+          std::cout << std::setw(13) << std::fixed << std::setprecision(0)
+                    << matrix[s][c].throughput;
+          best = std::max(best, matrix[s][c].throughput);
         }
-        std::cout << std::left << std::setw(9) << clients << std::right
-                  << std::setw(11) << per_client << std::setw(13) << std::fixed
-                  << std::setprecision(0) << throughput << std::setw(9)
-                  << std::setprecision(2)
-                  << (baseline > 0.0 ? throughput / baseline : 0.0) << "x"
-                  << std::setw(11) << std::setprecision(2)
-                  << result.latency.p50 / 1000.0 << std::setw(10)
-                  << result.latency.p95 / 1000.0 << std::setw(10)
-                  << result.latency.p99 / 1000.0 << std::setw(11)
-                  << result.failures << "\n";
+        const double baseline = matrix[0][c].throughput;
+        std::cout << std::setw(15) << std::showpos << std::setprecision(1)
+                  << (baseline > 0.0 ? 100.0 * (best / baseline - 1.0) : 0.0)
+                  << "%" << std::noshowpos << "\n";
+      }
+
+      std::cout << "\n" << title << " -- p99 latency (us)\n\n"
+                << std::left << std::setw(10) << "clients" << std::right;
+      for (const std::size_t shards : kShardCounts) {
+        std::cout << std::setw(13) << (std::to_string(shards) + " shard" +
+                                       (shards == 1 ? "" : "s"));
+      }
+      std::cout << std::setw(16) << "best vs 1" << "\n"
+                << std::string(10 + 13 * std::size(kShardCounts) + 16, '-') << "\n";
+      for (std::size_t c = 0; c < std::size(kClientCounts); ++c) {
+        std::cout << std::left << std::setw(10) << kClientCounts[c] << std::right;
+        double lowest = matrix[0][c].p99;
+        for (std::size_t s = 0; s < matrix.size(); ++s) {
+          std::cout << std::setw(13) << std::fixed << std::setprecision(2)
+                    << matrix[s][c].p99;
+          lowest = std::min(lowest, matrix[s][c].p99);
+        }
+        const double baseline = matrix[0][c].p99;
+        std::cout << std::setw(15) << std::showpos << std::setprecision(1)
+                  << (baseline > 0.0 ? 100.0 * (lowest / baseline - 1.0) : 0.0)
+                  << "%" << std::noshowpos << "\n";
+      }
+
+      std::cout << "\n" << title << " -- scaling vs 1 client, per shard count\n\n"
+                << std::left << std::setw(10) << "clients" << std::right;
+      for (const std::size_t shards : kShardCounts) {
+        std::cout << std::setw(13) << (std::to_string(shards) + " shard" +
+                                       (shards == 1 ? "" : "s"));
+      }
+      std::cout << "\n"
+                << std::string(10 + 13 * std::size(kShardCounts), '-') << "\n";
+      for (std::size_t c = 0; c < std::size(kClientCounts); ++c) {
+        std::cout << std::left << std::setw(10) << kClientCounts[c] << std::right;
+        for (std::size_t s = 0; s < matrix.size(); ++s) {
+          const double base = matrix[s][0].throughput;
+          std::cout << std::setw(12) << std::fixed << std::setprecision(2)
+                    << (base > 0.0 ? matrix[s][c].throughput / base : 0.0) << "x";
+        }
+        std::cout << "\n";
       }
     };
 
-    std::cout << "\n\nCONCURRENCY SCALING\n"
-              << "===================\n"
-              << "server: thread-per-connection, one std::mutex around the cache\n"
-              << "note:   clients and server share this machine's "
-              << std::thread::hardware_concurrency()
-              << " hardware threads, so past\n"
-              << "        that point they compete with each other for CPU.\n";
+    std::cout << "\n\nSHARDING OVER TCP\n"
+              << "=================\n"
+              << kTotalRequests
+              << " requests per configuration, split across N clients.\n"
+              << "Version A = 1 shard (one global mutex), B = 2, C = 4, D = 8.\n"
+              << "Clients and server share this machine's "
+              << std::thread::hardware_concurrency() << " hardware threads.\n";
 
-    // Control. PING takes no lock and touches no cache data, so whatever
-    // ceiling it hits is the transport's, not the cache's. If PING scales like
-    // GET, the mutex is not what is limiting either of them.
-    run_scaling("PING (control: no lock, no cache access)",
-                [](int, std::size_t) { return std::string("PING\n"); });
+    print_matrix("GET (all hits)",
+                 measure_matrix(
+                     [](int, std::size_t i) { return "GET " + pad_key(i) + "\n"; },
+                     true));
 
-    run_scaling("GET (all hits)", [&](int, std::size_t i) {
-      return "GET " + pad_key(i) + "\n";
-    });
-
-    run_scaling("SET", [&value](int client, std::size_t i) {
-      // Distinct key space per client, so this measures lock contention rather
-      // than clients overwriting each other.
-      return "SET c" + std::to_string(client) + ":" + pad_key(i) + " " + value +
-             "\n";
-    });
+    print_matrix("SET",
+                 measure_matrix(
+                     [&value](int client, std::size_t i) {
+                       return "SET c" + std::to_string(client) + ":" + pad_key(i) +
+                              " " + value + "\n";
+                     },
+                     false));
 
     // ====================================================================
-    // The same scaling question with the network removed entirely: N threads
-    // calling SyncCache::get() directly. This is the mutex on its own, with
-    // nothing to hide behind.
+    // The same matrix with the network removed: N threads calling the cache
+    // directly. This is where the lock is actually visible.
     // ====================================================================
-    std::cout << "\n\nIN-PROCESS LOCK CONTENTION (no sockets)\n"
-              << "N threads calling SyncCache::get() directly, "
-              << kTotalRequests << " total calls\n\n"
-              << std::left << std::setw(9) << "threads" << std::right
-              << std::setw(13) << "ops/sec" << std::setw(10) << "scaling"
-              << std::setw(13) << "ns/op" << "\n"
-              << std::string(45, '-') << "\n";
+    std::cout << "\n\nSHARDING IN-PROCESS (no sockets)\n"
+              << "================================\n"
+              << "N threads calling ShardedCache::get() directly, "
+              << kInProcessOps << " total calls.\n\n"
+              << std::left << std::setw(10) << "threads" << std::right;
+    for (const std::size_t shards : kShardCounts) {
+      std::cout << std::setw(13)
+                << (std::to_string(shards) + " shard" + (shards == 1 ? "" : "s"));
+    }
+    std::cout << std::setw(16) << "best vs 1" << "\n"
+              << std::string(10 + 13 * std::size(kShardCounts) + 16, '-') << "\n";
 
-    double lock_baseline = 0.0;
-    std::uint64_t lock_checksum = 0;
-    for (const int threads : kClientCounts) {
-      const std::size_t per_thread =
-          kTotalRequests / static_cast<std::size_t>(threads);
-      StartGate gate(threads);
-      std::vector<std::thread> workers;
-      workers.reserve(static_cast<std::size_t>(threads));
-      std::atomic<std::uint64_t> sink{0};
-
-      for (int w = 0; w < threads; ++w) {
-        workers.emplace_back([&, w] {
-          gate.arrive_and_wait();
-          std::uint64_t local = 0;
-          for (std::size_t i = 0; i < per_thread; ++i) {
-            if (const auto found = cache.get(pad_key((i * 7 + static_cast<std::size_t>(w)) %
-                                                     kTotalRequests))) {
-              local += found->size();
+    std::vector<std::vector<double>> in_process;
+    std::uint64_t in_process_checksum = 0;
+    for (const std::size_t shards : kShardCounts) {
+      cachex::ShardedCache sharded(shards);
+      for (std::size_t i = 0; i < kTotalRequests; ++i) {
+        sharded.set(pad_key(i), value);
+      }
+      std::vector<double> row;
+      for (const int threads : kClientCounts) {
+        const std::size_t per_thread =
+            kInProcessOps / static_cast<std::size_t>(threads);
+        StartGate gate(threads);
+        std::vector<std::thread> workers;
+        std::atomic<std::uint64_t> sink{0};
+        workers.reserve(static_cast<std::size_t>(threads));
+        for (int w = 0; w < threads; ++w) {
+          workers.emplace_back([&, w] {
+            gate.arrive_and_wait();
+            std::uint64_t local = 0;
+            for (std::size_t i = 0; i < per_thread; ++i) {
+              const std::size_t index =
+                  (i * 7 + static_cast<std::size_t>(w) * 1013) % kTotalRequests;
+              if (const auto found = sharded.get(pad_key(index))) {
+                local += found->size();
+              }
             }
-          }
-          sink.fetch_add(local);
-        });
+            sink.fetch_add(local);
+          });
+        }
+        gate.wait_until_all_ready();
+        const auto start = Clock::now();
+        gate.release();
+        for (std::thread& worker : workers) {
+          worker.join();
+        }
+        const auto elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
+        in_process_checksum += sink.load();
+        row.push_back(bench::ops_per_sec(
+            elapsed, per_thread * static_cast<std::size_t>(threads)));
       }
-      gate.wait_until_all_ready();
-      const auto start = Clock::now();
-      gate.release();
-      for (std::thread& worker : workers) {
-        worker.join();
-      }
-      const auto elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
-      // Printed at the end, so the optimiser cannot delete the gets.
-      lock_checksum += sink.load();
-
-      const std::size_t total = per_thread * static_cast<std::size_t>(threads);
-      const double throughput = bench::ops_per_sec(elapsed, total);
-      if (threads == kClientCounts[0]) {
-        lock_baseline = throughput;
-      }
-      std::cout << std::left << std::setw(9) << threads << std::right
-                << std::setw(13) << std::fixed << std::setprecision(0)
-                << throughput << std::setw(9) << std::setprecision(2)
-                << (lock_baseline > 0.0 ? throughput / lock_baseline : 0.0) << "x"
-                << std::setw(13) << std::setprecision(1)
-                << bench::avg_ns(elapsed, total) << "\n";
+      in_process.push_back(row);
     }
 
-    std::cout << "\n  (checksum " << lock_checksum << ")\n"
-              << "\n  scaling = throughput at N / throughput at 1. Perfect would be Nx.\n"
-              << "\n  Read the three tables together before blaming anything:\n"
-              << "    * PING takes no lock at all. If it plateaus where GET and SET\n"
-              << "      plateau, the ceiling over TCP is the transport and the\n"
-              << "      scheduler, not the cache mutex.\n"
-              << "    * The in-process table is the mutex with nowhere to hide. A\n"
-              << "      figure at or below 1.00x there means the lock is pure\n"
-              << "      serialisation -- threads take turns, and the extra threads\n"
-              << "      only add handoff cost.\n"
-              << "    * Latency rising roughly in proportion to client count, while\n"
-              << "      throughput is flat, is the signature of a saturated\n"
-              << "      resource: the queue is growing, not the service rate.\n";
+    for (std::size_t c = 0; c < std::size(kClientCounts); ++c) {
+      std::cout << std::left << std::setw(10) << kClientCounts[c] << std::right;
+      double best = 0.0;
+      for (const auto& row : in_process) {
+        std::cout << std::setw(13) << std::fixed << std::setprecision(0) << row[c];
+        best = std::max(best, row[c]);
+      }
+      const double baseline = in_process[0][c];
+      std::cout << std::setw(15) << std::showpos << std::setprecision(1)
+                << (baseline > 0.0 ? 100.0 * (best / baseline - 1.0) : 0.0) << "%"
+                << std::noshowpos << "\n";
+    }
+
+    // ====================================================================
+    // The correctness cost of sharding. LRU is per-shard, not global: each
+    // shard evicts its own least-recently-used entry knowing nothing about the
+    // others, so a hot key in a crowded shard can be dropped while a colder key
+    // in a quiet shard survives. This measures how much that costs in hit rate.
+    // ====================================================================
+    std::cout << "\n\nGLOBAL LRU vs PER-SHARD LRU (hit rate cost of sharding)\n"
+              << "======================================================\n"
+              << "Skewed 80/20 workload, cache-aside, single-threaded so only\n"
+              << "the eviction policy differs.\n\n"
+              << std::left << std::setw(12) << "capacity" << std::right;
+    for (const std::size_t shards : kShardCounts) {
+      std::cout << std::setw(13)
+                << (std::to_string(shards) + " shard" + (shards == 1 ? "" : "s"));
+    }
+    std::cout << std::setw(14) << "cost" << "\n"
+              << std::string(12 + 13 * std::size(kShardCounts) + 14, '-') << "\n";
+
+    {
+      const std::vector<bench::Request> skewed = bench::make_workload(
+          kSkewWorkloadOps, kKeySpaceForSkew, 90, /*skewed=*/true, kSeed);
+      for (const std::size_t percent : {5u, 10u, 20u, 40u}) {
+        const std::size_t cap = kKeySpaceForSkew * percent / 100;
+        std::cout << std::left << std::setw(12)
+                  << (std::to_string(percent) + "% (" + std::to_string(cap) + ")")
+                  << std::right;
+        double global_rate = 0.0;
+        double worst = 100.0;
+        for (const std::size_t shards : kShardCounts) {
+          cachex::ShardedCache sharded(shards, cap);
+          // Warm up, then measure -- the same steady-state method the LRU
+          // benchmark uses.
+          for (int pass = 0; pass < 2; ++pass) {
+            std::size_t hits = 0;
+            std::size_t gets = 0;
+            for (const bench::Request& r : skewed) {
+              if (r.op == bench::Op::Get) {
+                ++gets;
+                if (sharded.get(pad_key(r.key))) {
+                  ++hits;
+                } else {
+                  sharded.set(pad_key(r.key), value);
+                }
+              } else {
+                sharded.set(pad_key(r.key), value);
+              }
+            }
+            if (pass == 1) {
+              const double rate = gets > 0 ? 100.0 * static_cast<double>(hits) /
+                                                 static_cast<double>(gets)
+                                           : 0.0;
+              if (shards == kShardCounts[0]) {
+                global_rate = rate;
+              }
+              worst = std::min(worst, rate);
+              std::cout << std::setw(12) << std::fixed << std::setprecision(2)
+                        << rate << "%";
+            }
+          }
+        }
+        std::cout << std::setw(13) << std::showpos << std::setprecision(2)
+                  << (worst - global_rate) << "pp" << std::noshowpos << "\n";
+      }
+    }
+    std::cout << "\n  'cost' is the worst shard count's hit rate minus the\n"
+              << "  1-shard (true global LRU) hit rate, in percentage points.\n";
+
+    std::cout << "\n  (checksum " << in_process_checksum << ")\n"
+              << "\n  'best vs 1' compares the best shard count against 1 shard at\n"
+              << "  the same client count -- positive is better for throughput,\n"
+              << "  negative is better for p99 latency.\n";
   }
 
   server.stop();

@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-#include "cachex/sync_cache.hpp"
+#include "cachex/sharded_cache.hpp"
 #include "cachex/socket.hpp"
 
 namespace cachex {
@@ -44,7 +44,7 @@ class Server {
     bool verbose = true;
   };
 
-  Server(SyncCache& cache, Options options);
+  Server(ShardedCache& cache, Options options);
 
   /// socket() + bind() + listen(). Returns false on failure with `error` set.
   /// Separate from run() so that a caller -- notably a test -- can learn the
@@ -87,7 +87,7 @@ class Server {
   /// Joins every remaining worker. Called once, after the accept loop exits.
   void join_all_workers();
 
-  SyncCache& cache_;
+  ShardedCache& cache_;
   Options options_;
   Socket listener_;
   std::uint16_t bound_port_ = 0;

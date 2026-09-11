@@ -7,6 +7,7 @@
 #include "cachex/server.hpp"
 #include "cachex/socket.hpp"
 #include "cachex/line_buffer.hpp"
+#include "cachex/sharded_cache.hpp"
 #include "cachex/sync_cache.hpp"
 #include "test_framework.hpp"
 
@@ -244,7 +245,7 @@ class ConcurrentServerFixture {
   }
   bool started() const { return started_; }
   std::uint16_t port() const { return server_.bound_port(); }
-  cachex::SyncCache& cache() { return cache_; }
+  cachex::ShardedCache& cache() { return cache_; }
   const cachex::Server& server() const { return server_; }
 
  private:
@@ -254,7 +255,7 @@ class ConcurrentServerFixture {
     opts.verbose = false;
     return opts;
   }
-  cachex::SyncCache cache_;
+  cachex::ShardedCache cache_{1};
   cachex::Server server_;
   std::thread thread_;
   bool started_ = false;

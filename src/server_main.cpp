@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include "cachex/sync_cache.hpp"
+#include "cachex/sharded_cache.hpp"
 #include "cachex/server.hpp"
 #include "cachex/version.hpp"
 
@@ -22,9 +22,10 @@ void handle_signal(int) {
 }
 
 void usage(const char* program) {
-  std::cerr << "usage: " << program << " [port] [capacity]\n"
+  std::cerr << "usage: " << program << " [port] [capacity] [shards]\n"
             << "  port      TCP port to listen on (default 6379)\n"
-            << "  capacity  maximum entries, 0 for unbounded (default 0)\n";
+            << "  capacity  maximum entries total, 0 for unbounded (default 0)\n"
+            << "  shards    independently locked shards (default 8)\n";
 }
 
 }  // namespace
@@ -32,8 +33,9 @@ void usage(const char* program) {
 int main(int argc, char** argv) {
   std::uint16_t port = 6379;
   std::size_t capacity = 0;
+  std::size_t shards = 8;
 
-  if (argc > 3) {
+  if (argc > 4) {
     usage(argv[0]);
     return 2;
   }
@@ -44,16 +46,19 @@ int main(int argc, char** argv) {
     if (argc >= 3) {
       capacity = static_cast<std::size_t>(std::stoull(argv[2]));
     }
+    if (argc >= 4) {
+      shards = static_cast<std::size_t>(std::stoull(argv[3]));
+    }
   } catch (const std::exception&) {
     usage(argv[0]);
     return 2;
   }
 
-  // unique_ptr because SyncCache holds a mutex and so is neither copyable nor
+  // unique_ptr because ShardedCache owns mutexes and so is neither copyable nor
   // movable -- the two constructors cannot be selected with a ternary.
-  const auto cache = capacity > 0
-                         ? std::make_unique<cachex::SyncCache>(capacity)
-                         : std::make_unique<cachex::SyncCache>();
+  const auto cache =
+      capacity > 0 ? std::make_unique<cachex::ShardedCache>(shards, capacity)
+                   : std::make_unique<cachex::ShardedCache>(shards);
 
   cachex::Server::Options options;
   options.port = port;
@@ -75,6 +80,7 @@ int main(int argc, char** argv) {
             << (capacity > 0 ? std::to_string(capacity) + " entries"
                              : std::string("unbounded"))
             << "\n"
+            << "shards: " << cache->shard_count() << "\n"
             << "thread-per-connection, max " << options.max_connections
             << " concurrent clients\n"
             << "press Ctrl-C to stop\n"

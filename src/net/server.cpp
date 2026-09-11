@@ -23,7 +23,7 @@ constexpr int kAcceptPollMs = 100;
 
 }  // namespace
 
-Server::Server(SyncCache& cache, Options options)
+Server::Server(ShardedCache& cache, Options options)
     : cache_(cache), options_(std::move(options)) {}
 
 bool Server::start(std::string& error) {

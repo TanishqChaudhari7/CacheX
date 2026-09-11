@@ -6,13 +6,169 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §11](../ARCHITECTURE.md#11-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §12](../ARCHITECTURE.md#12-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
 ./build/release/bin/cachex_bench
 ```
+
+---
+
+## Stage 7 — sharding
+
+| | |
+| --- | --- |
+| Date | 2026-09-11 |
+| Machine | Apple M2 Pro, 12 cores / 12 hardware threads, 16 GB RAM |
+| OS | macOS 26.5.2 (arm64) |
+| Compiler | AppleClang 21.0.0, `-O3 -DNDEBUG`, C++17 |
+| Configurations | A = 1 shard (one global mutex), B = 2, C = 4, D = 8 |
+| Work | 32,000 requests per networked config; 600,000 per in-process config |
+
+Identical workload and machine conditions across every configuration. Full
+interpretation, including what sharding does and does not fix, is in
+[ARCHITECTURE.md → Measured Performance Improvements](../ARCHITECTURE.md#measured-performance-improvements).
+
+### Headline
+
+| | result |
+| --- | --- |
+| In-process, 4 threads, 8 shards vs 1 | **+232.0%** throughput (2.25M → 7.48M ops/sec) |
+| In-process, 1 thread | **+0.0%** — no contention to remove |
+| Over TCP, any client count | **≤ +0.8%** throughput, ≤2% p99 — inside noise |
+| Hit-rate cost of per-shard LRU | **≤ 0.02 percentage points** |
+
+The 4-thread in-process figure reproduced across three runs at **+227%, +232%,
++240%**. The 1-thread figure reproduced at +0.0% every time.
+
+### Raw benchmark output
+
+```
+SHARDING OVER TCP
+=================
+32000 requests per configuration, split across N clients.
+Version A = 1 shard (one global mutex), B = 2, C = 4, D = 8.
+Clients and server share this machine's 12 hardware threads.
+
+GET (all hits) -- throughput (req/sec)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 48510        48499        48469        48005           +0.0%
+2                 85206        84637        83432        84186           +0.0%
+4                 89629        89849        88865        90380           +0.8%
+8                122006       121745       121547       122563           +0.5%
+16               124484       124782       123071       123028           +0.2%
+
+GET (all hits) -- p99 latency (us)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 28.21        28.71        28.12        27.62           -2.1%
+2                 36.38        36.38        40.79        37.29           +0.0%
+4                 56.38        57.38        56.04        56.50           -0.6%
+8                 84.12        84.83        83.38        82.71           -1.7%
+16               148.42       149.62       170.12       176.75           +0.0%
+
+GET (all hits) -- scaling vs 1 client, per shard count
+
+clients         1 shard     2 shards     4 shards     8 shards
+--------------------------------------------------------------
+1                 1.00x        1.00x        1.00x        1.00x
+2                 1.76x        1.75x        1.72x        1.75x
+4                 1.85x        1.85x        1.83x        1.88x
+8                 2.52x        2.51x        2.51x        2.55x
+16                2.57x        2.57x        2.54x        2.56x
+
+SET -- throughput (req/sec)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 47916        47383        48286        48010           +0.8%
+2                 84041        76037        84802        85789           +2.1%
+4                 90450        90594        91204        90679           +0.8%
+8                120010       121023       121326       119925           +1.1%
+16               123277       123139       123357       123094           +0.1%
+
+SET -- p99 latency (us)
+
+clients         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1                 28.83        32.67        29.33        28.33           -1.7%
+2                 38.75        50.83        36.50        35.75           -7.7%
+4                 57.79        57.29        57.08        56.54           -2.2%
+8                 86.38        83.79        82.38        88.75           -4.6%
+16               155.21       152.21       152.75       155.25           -1.9%
+
+SET -- scaling vs 1 client, per shard count
+
+clients         1 shard     2 shards     4 shards     8 shards
+--------------------------------------------------------------
+1                 1.00x        1.00x        1.00x        1.00x
+2                 1.75x        1.60x        1.76x        1.79x
+4                 1.89x        1.91x        1.89x        1.89x
+8                 2.50x        2.55x        2.51x        2.50x
+16                2.57x        2.60x        2.55x        2.56x
+
+
+SHARDING IN-PROCESS (no sockets)
+================================
+N threads calling ShardedCache::get() directly, 600000 total calls.
+
+threads         1 shard     2 shards     4 shards     8 shards       best vs 1
+------------------------------------------------------------------------------
+1               7146193      6885913      6941097      6855821           +0.0%
+2               3853705      3837794      4093006      4882059          +26.7%
+4               2252335      3376833      4501711      7477789         +232.0%
+8               3289281      2466958      3060406      4685978          +42.5%
+16              3205524      2243006      2855006      4103501          +28.0%
+
+
+GLOBAL LRU vs PER-SHARD LRU (hit rate cost of sharding)
+======================================================
+Skewed 80/20 workload, cache-aside, single-threaded so only
+the eviction policy differs.
+
+capacity          1 shard     2 shards     4 shards     8 shards          cost
+------------------------------------------------------------------------------
+5% (5000)          15.92%       15.91%       15.93%       15.90%        -0.01pp
+10% (10000)        30.92%       30.92%       30.91%       30.93%        -0.02pp
+20% (20000)        57.78%       57.79%       57.81%       57.78%        +0.00pp
+40% (40000)        84.21%       84.21%       84.21%       84.20%        -0.01pp
+
+  'cost' is the worst shard count's hit rate minus the
+  1-shard (true global LRU) hit rate, in percentage points.
+
+  (checksum 768000000)
+```
+
+### Why the two results differ
+
+They are the same finding seen through different bottlenecks.
+
+Stage 5 measured a TCP round trip at ~20 µs against a ~0.4 µs cache operation, and
+Stage 6's `PING` control — which takes no lock at all — plateaued exactly where
+`GET` did. The transport, syscalls and scheduler cap throughput long before the
+cache mutex does. Removing contention from a 2% slice of the request cannot move
+the total, no matter how completely it is removed.
+
+Strip the network away and the lock is the only thing left, which is why the
+in-process numbers are dramatic and the networked ones are flat.
+
+**The practical lesson is the one that transfers:** an optimisation that is
+spectacular in a microbenchmark and invisible end to end has optimised something
+that was not the constraint. The only way to know which you have is to measure
+both, which is why this benchmark reports both.
+
+### An oddity, flagged rather than explained away
+
+In the in-process table the **1-shard column rises** from 4 to 8 threads
+(2.25M → 3.29M ops/sec). More contention should not be faster. The likely cause
+is lock-handoff batching — under heavy contention a thread that releases and
+immediately reacquires keeps the cache line locally, cutting cross-core traffic.
+That was not verified, so it is a hypothesis, not a finding.
 
 ---
 

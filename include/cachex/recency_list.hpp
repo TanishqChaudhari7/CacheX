@@ -13,7 +13,7 @@ namespace cachex {
 /// The key is stored here *as well as* in the Cache's hash map. That duplication
 /// is deliberate: eviction walks from the list to the map (take the oldest node,
 /// then remove its key from the index), and without the key in the node there
-/// would be no way to find the map entry to erase. See ARCHITECTURE.md §9.
+/// would be no way to find the map entry to erase. See ARCHITECTURE.md §10.
 struct Entry {
   /// steady_clock, not system_clock: it is monotonic, so an NTP correction or a
   /// manual clock change cannot resurrect an expired key or mass-expire live

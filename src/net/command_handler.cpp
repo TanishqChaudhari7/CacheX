@@ -2,7 +2,7 @@
 
 namespace cachex {
 
-std::string execute(SyncCache& cache, const Command& command) {
+std::string execute(ShardedCache& cache, const Command& command) {
   switch (command.type) {
     case CommandType::Set:
       if (command.ttl.has_value()) {

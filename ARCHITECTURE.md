@@ -1,7 +1,7 @@
 # CacheX — Architecture
 
 > Living document. It is updated at every stage of the project.
-> **Current stage: 6 — concurrency (thread-per-connection + one mutex).**
+> **Current stage: 7 — sharded cache.**
 
 | Legend | |
 | --- | --- |
@@ -49,7 +49,7 @@ the handful of things that demonstrate the concepts, and nothing more.
 | Networking | Single-node TCP server, line-based text protocol | ✅ Stage 5 |
 | Concurrency | Multiple clients served safely and, where possible, in parallel | ✅ Stage 6 |
 | Length-prefixed framing | Keys/values containing whitespace or binary data | ⬜ future |
-| Sharding | Cache split into independently locked shards | ⬜ Stage 9 |
+| Sharding | Cache split into independently locked shards | ✅ Stage 7 |
 | Persistence | Snapshot/restore so state survives a restart | ⬜ Stage 10 |
 
 ### Explicitly out of scope
@@ -206,7 +206,7 @@ exactly a hash table: average O(1), independent of how many keys are stored.
 **Its weaknesses, stated honestly** — these are the follow-up questions:
 
 - O(1) is *average*, not worst case. Adversarial keys that all hash to one bucket degrade it to O(n). Real caches on untrusted input mitigate this with a randomly seeded hash; CacheX assumes a trusted network (§2), so it does not.
-- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§11).
+- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§12).
 - Growth rehashes every element, so an individual `set` can be O(n) even though the amortised cost is O(1). A *bounded* cache reaches its final bucket count and then stops rehashing, so in the steady state this stops happening at all — one of the quieter benefits of adding capacity.
 
 ### 4.4 Why a doubly linked list
@@ -404,7 +404,7 @@ comparison. One `time_point` answers "is this expired?" with a single `<=`.
 state from any deadline, not a magic value of one. It also buys the performance
 property that matters most: `has_value()` is checked *first*, so an entry without
 a TTL never reads the clock at all. That short-circuit is why TTL is nearly free
-for keys that do not use it — and §11 measures exactly how much it costs for keys
+for keys that do not use it — and §12 measures exactly how much it costs for keys
 that do.
 
 `ttl()` returns a small tagged type rather than an integer:
@@ -1022,13 +1022,229 @@ The third signature to recognise: across all three TCP tables, **p50 latency
 rises roughly in proportion to client count (20 µs → 128 µs at 16) while
 throughput stays flat**. Growing queue, constant service rate — the definition of
 a saturated resource.
+---
+
+## 9. Sharding
+
+### 9.1 Design
+
+```
+                          ShardedCache
+                               │
+        ┌──────────────┬───────┴───────┬──────────────┐
+        │              │               │              │
+     Shard 0        Shard 1         Shard 2       Shard N-1
+   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+   │ mutex    │   │ mutex    │   │ mutex    │   │ mutex    │
+   │ hash map │   │ hash map │   │ hash map │   │ hash map │
+   │ LRU list │   │ LRU list │   │ LRU list │   │ LRU list │
+   │ capacity │   │ capacity │   │ capacity │   │ capacity │
+   └──────────┘   └──────────┘   └──────────┘   └──────────┘
+```
+
+Each shard is a complete, independent `SyncCache`. Nothing is shared between
+shards — no cross-shard lock, and therefore no lock ordering to get wrong and no
+way to deadlock.
+
+Every operation locks **exactly one** shard, chosen by hashing the key. Threads
+working on keys in different shards never wait for each other. One global mutex
+makes the cache one sequential section; N shards make it N sequential sections
+that run in parallel.
+
+`ShardedCache` exposes the identical API to `SyncCache`, so **the network layer
+does not know sharding exists** — changing the shard count does not touch a line
+of it. Shard count is a constructor argument and a server command-line flag.
+
+### 9.2 Shard selection
+
+```cpp
+std::uint64_t h = std::hash<std::string>{}(key);
+h ^= h >> 30;  h *= 0xbf58476d1ce4e5b9ULL;   // splitmix64 finalizer
+h ^= h >> 27;  h *= 0x94d049bb133111ebULL;
+h ^= h >> 31;
+shard_index = h % shard_count;
+```
+
+**Why the extra mixing step, rather than `std::hash(key) % shard_count`?**
+Because the shard's own `unordered_map` also hashes the key with `std::hash` to
+pick a bucket. Using the raw value for both means every key in a shard shares
+`h % shard_count`, which correlates with the bucket index whenever the shard
+count and bucket count share a factor — clustering keys into a few buckets of
+each shard's map and quietly degrading lookups. The finalizer is three shifts and
+two multiplies, and it decorrelates the two uses.
+
+A test checks the distribution directly: 8000 keys across 8 shards must land
+within ±25% of even. Clustering would defeat the whole point — crowded shards
+would contend exactly as badly as one global mutex.
+
+### 9.3 Capacity distribution
+
+Total capacity is split as evenly as possible, with the remainder handed to the
+first few shards so the parts sum to **exactly** the requested total (10 across
+4 shards → 3, 3, 2, 2 — not 2, 2, 2, 2).
+
+If the total capacity is smaller than the shard count, the shard count is
+**reduced** so no shard gets capacity 0. A zero-capacity shard would accept no
+keys at all, and every key hashing to it would vanish silently — a memorable bug,
+and easy to prevent here.
+
+### 9.4 Correctness trade-offs
+
+Two things genuinely change, and both are the price of removing the shared lock.
+
+**1. LRU is per-shard, not global.** Each shard evicts its own least recently
+used entry knowing nothing about the others. A hot key in a crowded shard can be
+evicted while a colder key in a quiet shard survives. True global LRU would need
+a single recency list — which is the very thing being removed.
+
+*Measured cost:* on a skewed 80/20 workload, **≤0.02 percentage points** of hit
+rate across 1/2/4/8 shards at every capacity tested (§9.6). Effectively free
+here, because the hash spreads keys evenly enough that each shard sees a
+statistically similar slice of the distribution. It would not be free with very
+few shards, a small capacity, and a hot set that happened to concentrate in one
+shard — the general claim is *"cheap when keys distribute evenly"*, not *"free"*.
+
+**2. `size()` is not a consistent snapshot.** It locks each shard in turn and
+sums, so another thread can modify a shard that has already been counted. It is
+exact on a quiescent cache and approximate under load. A globally consistent
+count would need every shard locked at once — reintroducing precisely the
+bottleneck sharding exists to remove. The same applies to `evictions()` and
+`expired_removals()`.
+
+Everything a single-key operation can observe is unchanged: `get`, `set`,
+`erase`, `contains` and `ttl` behave identically at any shard count, and a test
+asserts exactly that against 1, 4 and 16 shards.
+
+### 9.5 Lock contention, and why sharding addresses it
+
+With one mutex, every operation queues behind every other one regardless of which
+key it touches. Threads do not get faster by waiting; they take turns. Stage 6
+measured this directly: N threads on one mutex scaled 1.00x → 0.83x → 0.48x —
+**adding threads made it slower**, because the extra threads contributed only
+contention and handoff cost.
+
+Sharding replaces one queue with N queues. Two threads collide only when their
+keys hash to the same shard, which for N shards and well-distributed keys happens
+about 1/N of the time.
+
+The limit is worth stating: sharding reduces contention, it does not eliminate
+it. Keys are not guaranteed to spread evenly, and a genuinely hot single key puts
+all its traffic on one shard no matter how many shards exist.
+
+---
+
+## Measured Performance Improvements
+
+Every number below is benchmark output from `cachex_net_bench` on this machine
+(Apple M2 Pro, 12 hardware threads, AppleClang 21, `-O3 -DNDEBUG`). Identical
+workload and machine conditions across all configurations; 32,000 requests per
+networked configuration, 600,000 per in-process configuration.
+
+**Version A = 1 shard (one global mutex), B = 2 shards, C = 4, D = 8.**
+
+### In-process — `ShardedCache::get()` called directly, no sockets
+
+Throughput in ops/sec:
+
+| threads | A (1 shard) | B (2) | C (4) | D (8) | best vs A |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7,146,193 | 6,885,913 | 6,941,097 | 6,855,821 | **+0.0%** |
+| 2 | 3,853,705 | 3,837,794 | 4,093,006 | 4,882,059 | **+26.7%** |
+| 4 | 2,252,335 | 3,376,833 | 4,501,711 | 7,477,789 | **+232.0%** |
+| 8 | 3,289,281 | 2,466,958 | 3,060,406 | 4,685,978 | **+42.5%** |
+| 16 | 3,205,524 | 2,243,006 | 2,855,006 | 4,103,501 | **+28.0%** |
+
+The 4-thread result reproduced across three runs at **+227%, +232%, +240%**
+(2.2M → 7.3–7.5M ops/sec, i.e. **3.3x**). The 1-thread result reproduced at
+**+0.0%** every time.
+
+Two things this says plainly:
+
+- **With no contention there is nothing to win.** At 1 thread, sharding is flat to very slightly negative — it adds a hash and an indirection and removes no waiting, because there was none.
+- **Under contention the win is large and scales with shard count.** At 4 threads the ordering is monotonic: 2.25M → 3.38M → 4.50M → 7.48M for 1 → 2 → 4 → 8 shards.
+
+An oddity worth flagging rather than explaining away: the 1-shard column *rises*
+from 4 to 8 threads (2.25M → 3.29M). More contention should not be faster. The
+likely cause is lock-handoff batching — under heavy contention a thread that
+releases and immediately reacquires keeps the cache line locally, reducing
+cross-core traffic — but that was not verified, so it is a hypothesis, not a
+finding.
+
+### Over TCP — the full A/B/C/D × 1/2/4/8/16 matrix
+
+GET, throughput in req/sec:
+
+| clients | A (1 shard) | B (2) | C (4) | D (8) | best vs A |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 48,510 | 48,499 | 48,469 | 48,005 | +0.0% |
+| 2 | 85,206 | 84,637 | 83,432 | 84,186 | +0.0% |
+| 4 | 89,629 | 89,849 | 88,865 | 90,380 | +0.8% |
+| 8 | 122,006 | 121,745 | 121,547 | 122,563 | +0.5% |
+| 16 | 124,484 | 124,782 | 123,071 | 123,028 | +0.2% |
+
+GET, p99 latency in µs:
+
+| clients | A (1 shard) | B (2) | C (4) | D (8) | best vs A |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 28.21 | 28.71 | 28.12 | 27.62 | −2.1% |
+| 2 | 36.38 | 36.38 | 40.79 | 37.29 | +0.0% |
+| 4 | 56.38 | 57.38 | 56.04 | 56.50 | −0.6% |
+| 8 | 84.12 | 84.83 | 83.38 | 82.71 | −1.7% |
+| 16 | 148.42 | 149.62 | 170.12 | 176.75 | +0.0% |
+
+Scaling vs 1 client is ~2.6x at 16 clients for **every** shard count — 1 shard
+included.
+
+**Over TCP, sharding changes nothing measurable.** Throughput moves by ≤0.8% and
+p99 by ≤2%, both inside run-to-run noise, and SET behaves the same way.
+
+That is not a contradiction of the in-process result; it is the same finding seen
+through a different bottleneck. Stage 5 measured a round trip at ~20 µs against a
+~0.4 µs cache operation, and Stage 6's `PING` control — which takes no lock at
+all — plateaued exactly where `GET` did. The transport, syscalls and scheduler
+cap throughput long before the cache mutex does, so removing contention from a
+2% slice of the request is invisible end to end.
+
+### Global LRU vs per-shard LRU — the correctness cost
+
+Hit rate on a skewed 80/20 workload, cache-aside, single-threaded:
+
+| capacity | A (1 shard) | B (2) | C (4) | D (8) | cost |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5% (5,000) | 15.92% | 15.91% | 15.93% | 15.90% | −0.01pp |
+| 10% (10,000) | 30.92% | 30.92% | 30.91% | 30.93% | −0.02pp |
+| 20% (20,000) | 57.78% | 57.79% | 57.81% | 57.78% | +0.00pp |
+| 40% (40,000) | 84.21% | 84.21% | 84.21% | 84.20% | −0.01pp |
+
+Giving up global LRU cost at most **0.02 percentage points** of hit rate.
+
+### Conclusions
+
+**When sharding helps.** When threads contend for the cache itself and the keys
+distribute evenly — the in-process case, where it delivered **3.3x at 4 threads**.
+That is the honest headline number, and it is an in-process figure, not an
+end-to-end one.
+
+**When sharding does not help.**
+
+- **When there is no contention.** At 1 thread it is +0.0%: a hash and an indirection bought in exchange for waiting that never happened.
+- **When something else is the bottleneck.** Over TCP the transport dominates, and sharding is worth ≤0.8%. This is the important one: optimising a component that is not the limiting factor produces no end-to-end change, however good the microbenchmark looks.
+- **When the load is skewed onto one key.** All its traffic lands on one shard regardless of shard count.
+- **When a globally consistent view is required.** `size()` across shards is approximate under load.
+
+**What this says to do next.** The measurements point at the I/O model, not the
+cache: an event loop instead of a thread per connection attacks the bottleneck
+that is actually binding. Sharding is now in place for when that ceiling lifts —
+which is the right order, because it was chosen from data rather than from
+intuition about which part *looked* slow.
+
 
 
 
 
 ---
 
-## 9. Complexity
+## 10. Complexity
 
 All bounds assume a hash function that distributes keys reasonably.
 
@@ -1053,20 +1269,20 @@ always `entries_.oldest()` — the tail of the list — reachable in constant ti
 and expiry is only ever checked on an entry an operation is already holding.
 
 **Space: O(n)**, bounded by `capacity` once one is set. Per entry, roughly:
-the key twice (§10), the value once, two list pointers, and the map's node and
+the key twice (§11), the value once, two list pointers, and the map's node and
 bucket overhead. For a 16-byte key and a 64-byte value that is an estimated
 ~180–200 bytes for ~80 bytes of payload. ⬜ *That figure is an estimate from the
 data layout, not a measurement; measuring it properly is Stage 11 work.*
 
 A caveat that matters more than the table: **every operation here is O(1), and
-they still differ by roughly 10× in measured cost** (§11). The constant factors —
+they still differ by roughly 10× in measured cost** (§12). The constant factors —
 allocation, copying, and memory locality — dominate at this scale. The table is
 the right answer to "how does this scale?" and the wrong answer to "which is
 fastest?".
 
 ---
 
-## 10. Ownership and Lifetime
+## 11. Ownership and Lifetime
 
 This is where a cache of this shape goes wrong, so it is worth being precise.
 
@@ -1154,7 +1370,7 @@ tests pin this (`get_missing_key_returns_nullopt`,
 
 ---
 
-## 11. Benchmark Methodology
+## 12. Benchmark Methodology
 
 Source: `benchmarks/cache_benchmark.cpp`. Results: `benchmarks/RESULTS.md`.
 
@@ -1264,7 +1480,7 @@ Headline findings from the Stage 3 run:
 
 ---
 
-## 12. Current Components
+## 13. Current Components
 
 | Path | Purpose | Status |
 | --- | --- | --- |
@@ -1276,7 +1492,8 @@ Headline findings from the Stage 3 run:
 | `include/cachex/command_handler.hpp` | `execute(Cache&, Command)` — the bridge | ✅ |
 | `include/cachex/connection.hpp` | One client's read/dispatch/write loop | ✅ |
 | `include/cachex/server.hpp` | Listening socket, accept loop, worker threads | ✅ |
-| `include/cachex/sync_cache.hpp` | Thread-safe wrapper: one mutex around Cache | ✅ |
+| `include/cachex/sync_cache.hpp` | Thread-safe wrapper: one mutex around Cache (one shard) | ✅ |
+| `include/cachex/sharded_cache.hpp` | N independently locked shards; same API | ✅ |
 | `src/net/` | Implementations of the above | ✅ |
 | `src/server_main.cpp`, `src/client_main.cpp` | `cachex_server`, `cachex_client` | ✅ |
 | `docs/PROTOCOL.md` | The wire protocol specification | ✅ |
@@ -1290,6 +1507,7 @@ Headline findings from the Stage 3 run:
 | `tests/protocol_test.cpp` | Parser and reply formatting, no sockets | ✅ |
 | `tests/server_test.cpp` | Integration: a real server over a real socket | ✅ |
 | `tests/concurrency_test.cpp` | Parallel readers/writers, mixed workloads, many clients | ✅ |
+| `tests/sharding_test.cpp` | Shard selection, distribution, capacity split, per-shard LRU | ✅ |
 | `tests/recency_list_test.cpp` | Ordering and iterator stability | ✅ |
 | `benchmarks/` | `cachex_bench` + `RESULTS.md`; off by default | ✅ |
 | `docs/` | Longer-form notes | — |
@@ -1329,9 +1547,9 @@ server will run.
 
 ---
 
-## 13. Design Decisions
+## 14. Design Decisions
 
-### 13.1 Why C++17 rather than C++20
+### 14.1 Why C++17 rather than C++20
 
 C++17 already contains everything this project needs, and Stage 3 leans on
 `std::optional` twice — once for a lookup that may miss, once for a capacity that
@@ -1346,7 +1564,7 @@ their machine.
 | `std::format` | Convenience only; library support is still uneven. |
 | Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It does not bite yet, but it will when the protocol parser hands over views into a socket buffer (Stage 7). The fix is a transparent hash functor, not a language upgrade. |
 
-### 13.2 Why CMake
+### 14.2 Why CMake
 
 The de-facto standard for C++, so it is what reviewers expect and what IDEs,
 `clangd`, sanitizers, and CI already understand. It makes Debug/Release a
@@ -1354,7 +1572,7 @@ configuration flag rather than hand-maintained compiler invocations. The CMake
 here is **target-based**: properties attach to targets rather than directory-wide
 globals, so include paths and flags travel with the target that needs them.
 
-### 13.3 Why warnings are an INTERFACE target
+### 14.3 Why warnings are an INTERFACE target
 
 `cachex_warnings` carries no code, only flags; targets opt in by linking it.
 Appending to global `CMAKE_CXX_FLAGS` would apply them to any third-party library
@@ -1364,7 +1582,7 @@ past is how a real warning in our own code gets missed.
 `-Werror` is available (`-DCACHEX_WARNINGS_AS_ERRORS=ON`) but off by default, so a
 new compiler version with a new warning cannot break someone's clone.
 
-### 13.4 Why the test framework is hand-written
+### 14.4 Why the test framework is hand-written
 
 ~100 lines of header, no dependency. Only three capabilities are needed: register
 a test, assert a condition, exit non-zero. GoogleTest or Catch2 would be the
@@ -1378,7 +1596,7 @@ a namespace-scope registry could be registered *into* before it was constructed.
 A function-local static is constructed on first use. This is the *static
 initialisation order fiasco*.
 
-### 13.5 Why the tests run under sanitizers
+### 14.5 Why the tests run under sanitizers
 
 The correctness of this design rests on a claim about iterator validity, and
 nothing in the type system enforces it. A dangling `std::list` iterator will
@@ -1395,14 +1613,14 @@ cmake --build build/asan -j --target cachex_tests && ./build/asan/bin/cachex_tes
 leaks --atExit -- ./build/debug/bin/cachex_tests
 ```
 
-### 13.6 Why the version header is generated
+### 14.6 Why the version header is generated
 
 `configure_file()` expands `include/cachex/version.hpp.in` into the build
 directory, substituting the version from `project()`. Otherwise the version lives
 in two places and drifts. The generated header goes in the build tree, never the
 source tree.
 
-### 13.7 Why `build/` is not committed
+### 14.7 Why `build/` is not committed
 
 Build output is reproducible from the sources, specific to one compiler and one
 machine, goes stale the instant a flag changes, and makes every diff unreadable.
@@ -1410,7 +1628,7 @@ Commit the inputs, never the outputs.
 
 ---
 
-## 14. Interview Questions I Should Be Able To Answer
+## 15. Interview Questions I Should Be Able To Answer
 
 ### Why not use only a hash map?
 
@@ -1558,7 +1776,7 @@ it rejects `SET ... EX 0` as an error, and uses `EXPIRE key 0` for the delete.
 ~12% of a GET hit, measured — about 12 ns, which is one `steady_clock::now()`
 read. Keys *without* a TTL pay none of it, because the `optional` is tested
 before the clock is read. That short-circuit is the whole reason TTL is close to
-free for keys that do not use it. §11.
+free for keys that do not use it. §12.
 
 ### How would you test something that depends on time without flaky tests?
 
@@ -1737,6 +1955,57 @@ switching and stack memory dominate. The answer is an event loop (a handful of
 threads multiplexing many sockets with `epoll`/`kqueue`), and separately sharding
 the cache so the lock stops being one sequential section.
 
+### How does sharding reduce lock contention?
+
+One mutex makes the cache a single queue: every operation waits behind every
+other one, whatever key it touches. N shards make it N independent queues, each
+with its own mutex, map and LRU list. Two threads collide only when their keys
+hash to the same shard — roughly 1/N of the time for well-distributed keys.
+
+Measured in isolation: 4 threads calling `get()` went from 2.25M ops/sec with 1
+shard to 7.48M with 8 shards, **+232%**.
+
+### When does sharding NOT help?
+
+Four cases, three of them measured here:
+
+1. **No contention.** At 1 thread it is +0.0% — a hash and an indirection bought in exchange for waiting that never happened.
+2. **Something else is the bottleneck.** Over TCP, sharding moved throughput by ≤0.8%, because a ~20 µs round trip dwarfs a ~0.4 µs cache operation. Optimising a non-binding constraint changes nothing end to end, however good the microbenchmark looks.
+3. **One hot key.** All its traffic lands on one shard regardless of shard count.
+4. **A globally consistent view is needed.** `size()` locks shards one at a time, so it is approximate under load; making it exact would reintroduce the global lock.
+
+### What does sharding cost in correctness?
+
+LRU becomes per-shard rather than global: a hot key in a crowded shard can be
+evicted while a colder key in a quiet shard survives. Measured on a skewed
+workload, that cost **≤0.02 percentage points** of hit rate — effectively free,
+because the hash spreads keys evenly enough that every shard sees a similar slice
+of the distribution. The honest claim is "cheap when keys distribute evenly", not
+"free".
+
+`size()` also stops being a consistent snapshot, for the same reason.
+
+### Why not just hash the key to pick the shard?
+
+Because the shard's own `unordered_map` already hashes the key with `std::hash`
+to choose a bucket. If the shard index used the same value, every key in a shard
+would share `h % shard_count` — which correlates with the bucket index whenever
+the shard count and bucket count share a factor, clustering keys into a few
+buckets of each map. Running the hash through a mixing step (splitmix64's
+finalizer) decorrelates the two uses. A test checks 8000 keys land within ±25% of
+even across 8 shards.
+
+### How many shards should you use?
+
+It is a tuning knob, not a constant to derive. More shards means less contention
+but more memory overhead (each carries its own map, list and mutex) and finer
+capacity granularity — and with total capacity below the shard count, shards
+would get zero capacity, which `ShardedCache` prevents by reducing the count.
+
+The measured answer here: the win was monotonic from 1 to 8 shards at 4 threads,
+so 8 was not yet the point of diminishing returns for this workload. A sensible
+default is a small multiple of the core count.
+
 ### How would you test that eviction is correct?
 
 Not by checking `size()` — that passes even if the *wrong* entry is evicted. The
@@ -1747,7 +2016,7 @@ test that verifies the map and the list still agree on which keys exist.
 
 ---
 
-## 15. Future Roadmap
+## 16. Future Roadmap
 
 **Everything below is ⬜ future work.**
 
@@ -1759,8 +2028,8 @@ test that verifies the map and the list still agree on which keys exist.
 | 4 | TTL | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
 | 5 | **TCP server + protocol** | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
 | 6 | **Concurrency** | Thread-per-connection, SyncCache, scaling benchmark | Data races, mutexes, contention, why `shared_mutex` disappoints for LRU | ✅ |
-| 7 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
-| 8 | Sharded cache | N independently locked shards | Lock contention as the real bottleneck | ⬜ |
+| 8 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
+| 7 | **Sharded cache** | N independently locked shards, A/B/C/D benchmark matrix | Lock contention; when optimising the wrong thing changes nothing | ✅ |
 | 9 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
 | 10 | Persistence | Snapshot to disk, restore on startup | Serialisation; durability vs. throughput | ⬜ |
 | 11 | Final optimisation | Profile, tune, re-benchmark against the recorded baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
@@ -1770,5 +2039,5 @@ it cannot safely precede thread safety (§6.5). Earlier documents referred to
 concurrency as "Stage 7" or "Stage 8"; the ordering is what matters, not the
 number.
 
-Each stage ends with this document updated: components in §12, decisions in §13,
-new questions in §14, and the diagram in §3 grown to match what actually exists.
+Each stage ends with this document updated: components in §13, decisions in §14,
+new questions in §15, and the diagram in §3 grown to match what actually exists.

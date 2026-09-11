@@ -14,17 +14,16 @@ it, and the full roadmap.
 
 ## Status
 
-**Stage 6 of 11 — concurrency.**
+**Stage 7 of 11 — sharded cache.**
 
-The server now serves many clients at once: **thread-per-connection**, with the
-shared cache wrapped in `SyncCache` — one coarse-grained `std::mutex` around the
-whole thing. 167 tests pass, including under AddressSanitizer,
-UndefinedBehaviorSanitizer and **ThreadSanitizer**, with zero leaks.
+The cache is split into N independently locked shards, so threads working on keys
+in different shards never wait for each other. `ShardedCache` exposes the same API
+as before, so the network layer never learns sharding exists. 186 tests pass,
+including under AddressSanitizer, UndefinedBehaviorSanitizer and
+**ThreadSanitizer**, with zero leaks.
 
-Measured scaling from 1 → 16 concurrent clients is in
-[benchmarks/RESULTS.md](benchmarks/RESULTS.md); the short version is that the
-mutex is *not yet* the bottleneck over TCP, and the benchmark includes the
-control that proves it.
+**Measured: +232% throughput at 4 threads in-process — and ≤0.8% over TCP.**
+Both numbers matter; see [the results](#sharding-results) below.
 
 | | |
 | --- | --- |
@@ -33,9 +32,10 @@ control that proves it.
 | ✅ Stage 3 | Fixed capacity, O(1) LRU eviction, workload benchmarks |
 | ✅ Stage 4 | Per-key TTL, lazy expiration, measured TTL cost |
 | ✅ Stage 5 | TCP server, line protocol, CLI client, network benchmark |
-| ✅ Stage 6 | Thread-per-connection, `SyncCache`, 167 tests, TSan clean, scaling benchmark |
-| ⬜ Next | Stage 7 — benchmark harness II (sub-tick latency) |
-| ⬜ Later | sharding · active expiry · persistence · optimisation |
+| ✅ Stage 6 | Thread-per-connection, `SyncCache`, TSan clean, scaling benchmark |
+| ✅ Stage 7 | Sharded cache, 186 tests, A/B/C/D × 1–16 client benchmark matrix |
+| ⬜ Next | Stage 8 — benchmark harness II (sub-tick latency) |
+| ⬜ Later | active expiry · persistence · event loop · optimisation |
 
 ## Try it
 
@@ -144,12 +144,17 @@ resurrect an expired key or mass-expire the whole cache.
 
 ### Thread safety
 
-`Cache` is **single-threaded by design** — it pays for no locking. To share it
-between threads, use `SyncCache`, which wraps it in one mutex:
+`Cache` is **single-threaded by design** — it pays for no locking. Two wrappers
+make it shareable, with the same API as `Cache` itself:
 
 ```cpp
-cachex::SyncCache cache(1000);   // same API, safe from any number of threads
+cachex::SyncCache   cache(1000);        // one mutex around everything
+cachex::ShardedCache sharded(8, 1000);  // 8 independent shards, 1000 total
 ```
+
+`ShardedCache` hashes the key to pick a shard and locks only that one. Shard count
+is a pure tuning knob: behaviour is identical at any count, and a test asserts
+that against 1, 4 and 16 shards.
 
 Note that **`get()` takes an exclusive lock**, not a shared one. Under LRU a read
 *is* a write: it splices the entry to the head of the recency list and may reclaim
@@ -226,7 +231,7 @@ Three executables:
 
 | Binary | What it is |
 | --- | --- |
-| `cachex_server [port] [capacity]` | The TCP server, thread-per-connection. Port defaults to 6379, capacity 0 means unbounded. |
+| `cachex_server [port] [capacity] [shards]` | The TCP server, thread-per-connection. Defaults: port 6379, capacity 0 (unbounded), 8 shards. |
 | `cachex_client [host] [port]` | Interactive CLI client. |
 | `cachex` | In-process demo of the cache API — no networking, useful for seeing LRU and TTL directly. |
 
@@ -286,6 +291,7 @@ The suite covers four layers:
 | `protocol_test` | Parsing and reply formatting, plus a whole request/response cycle **with no socket involved** |
 | `server_test` | Integration — a real `Server` on a real socket on an OS-assigned port |
 | `concurrency_test` | Parallel readers and writers, mixed GET/SET/DELETE, many simultaneous clients |
+| `sharding_test` | Shard selection and distribution, capacity split, per-shard LRU, concurrent access |
 
 The suite takes ~3 s, almost all of it the TTL tests sleeping. Timing tolerances
 are chosen so only an order-of-magnitude stall could produce a flake; 20
@@ -402,6 +408,36 @@ about concurrency rather than micro-optimisation.
 Unlike the in-process benchmark, these percentiles are *real measurements*: a
 round trip is three orders of magnitude above the 41 ns clock tick.
 
+<a id="sharding-results"></a>
+
+### Sharding results
+
+The benchmark runs the full matrix: 1 / 2 / 4 / 8 shards × 1 / 2 / 4 / 8 / 16
+clients, identical workload throughout.
+
+**In-process** (`ShardedCache::get()` called directly, 600k ops) — ops/sec:
+
+| threads | 1 shard | 2 | 4 | 8 | best vs 1 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 7,146,193 | 6,885,913 | 6,941,097 | 6,855,821 | **+0.0%** |
+| 2 | 3,853,705 | 3,837,794 | 4,093,006 | 4,882,059 | **+26.7%** |
+| 4 | 2,252,335 | 3,376,833 | 4,501,711 | 7,477,789 | **+232.0%** |
+| 8 | 3,289,281 | 2,466,958 | 3,060,406 | 4,685,978 | **+42.5%** |
+| 16 | 3,205,524 | 2,243,006 | 2,855,006 | 4,103,501 | **+28.0%** |
+
+**Over TCP** — GET throughput moved by **≤0.8%** and p99 by **≤2%** at every
+client count. Not a contradiction: a ~20 µs round trip dwarfs a ~0.4 µs cache
+operation, so removing contention from 2% of a request is invisible end to end.
+Stage 6's lock-free `PING` control already predicted this.
+
+**Cost of per-shard LRU:** ≤0.02 percentage points of hit rate on a skewed
+workload.
+
+So: **sharding helps when the cache is the bottleneck, and does nothing when it
+isn't.** The full tables, including SET and all p50/p95/p99 figures, are in
+[benchmarks/RESULTS.md](benchmarks/RESULTS.md) and
+[ARCHITECTURE.md](ARCHITECTURE.md#measured-performance-improvements).
+
 ### Concurrency scaling
 
 The same binary measures 1 → 16 concurrent clients. `scaling` is
@@ -428,7 +464,7 @@ limit — which is the argument for sharding.
 Full tables and interpretation: [benchmarks/RESULTS.md](benchmarks/RESULTS.md).
 
 Methodology — and what is deliberately *not* measured yet — is in
-[ARCHITECTURE.md §11](ARCHITECTURE.md#11-benchmark-methodology).
+[ARCHITECTURE.md §12](ARCHITECTURE.md#12-benchmark-methodology).
 
 ## Project layout
 
@@ -445,6 +481,7 @@ CacheX/
 │   ├── command_handler.hpp     execute(Cache&, Command) — the bridge
 │   ├── socket.hpp              RAII fd owner, send_all
 │   ├── sync_cache.hpp          thread-safe wrapper: one mutex around Cache
+│   ├── sharded_cache.hpp       N independently locked shards, same API
 │   ├── connection.hpp          one client's read/dispatch/write loop
 │   ├── server.hpp              accept loop + worker threads
 │   └── version.hpp.in          template → generated into the build tree
@@ -464,7 +501,8 @@ CacheX/
 │   ├── line_buffer_test.cpp    framing: split reads, batched reads, CRLF
 │   ├── protocol_test.cpp       parser + replies, no sockets
 │   ├── server_test.cpp         integration over a real socket
-│   └── concurrency_test.cpp    parallel access, many clients
+│   ├── concurrency_test.cpp    parallel access, many clients
+│   └── sharding_test.cpp       shard selection, capacity split, per-shard LRU
 ├── benchmarks/
 │   ├── cache_benchmark.cpp     in-process
 │   ├── net_benchmark.cpp       over TCP
@@ -494,10 +532,10 @@ request/response behaviour testable without opening a connection.
 | 4 | TTL / key expiry | ✅ Done |
 | 5 | TCP server + wire protocol + CLI client | ✅ Done |
 | 6 | Concurrency (thread-per-connection + mutex) | ✅ Done |
-| 7 | Benchmark harness II (sub-tick latency) | ⬜ |
-| 8 | Sharded cache | ⬜ |
+| 7 | Sharded cache | ✅ Done |
+| 8 | Benchmark harness II (sub-tick latency) | ⬜ |
 | 9 | Active expiry | ⬜ |
 | 10 | Persistence | ⬜ |
 | 11 | Final optimisation and benchmarking | ⬜ |
 
-Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#15-future-roadmap).
+Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#16-future-roadmap).

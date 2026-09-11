@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "cachex/sync_cache.hpp"
+#include "cachex/sharded_cache.hpp"
 #include "cachex/command_handler.hpp"
 #include "test_framework.hpp"
 
@@ -181,7 +181,7 @@ CACHEX_TEST(an_empty_value_is_distinguishable_from_nil) {
 // --- command execution (no sockets involved) -------------------------------
 
 CACHEX_TEST(execute_runs_a_whole_request_response_cycle_without_a_socket) {
-  cachex::SyncCache cache;
+  cachex::ShardedCache cache{1};
   const auto run = [&cache](const std::string& line) {
     const auto parsed = cachex::parse_command(line);
     return parsed.ok ? cachex::execute(cache, parsed.command)
@@ -203,7 +203,7 @@ CACHEX_TEST(execute_runs_a_whole_request_response_cycle_without_a_socket) {
 }
 
 CACHEX_TEST(execute_reports_ttl_in_seconds_rounded_up) {
-  cachex::SyncCache cache;
+  cachex::ShardedCache cache{1};
   cache.set("k", "v", std::chrono::milliseconds(900));
 
   // 900 ms left must not report ":0" -- the key is still readable.
@@ -214,7 +214,7 @@ CACHEX_TEST(execute_reports_ttl_in_seconds_rounded_up) {
 }
 
 CACHEX_TEST(execute_applies_a_ttl_of_zero_as_a_delete) {
-  cachex::SyncCache cache;
+  cachex::ShardedCache cache{1};
   cache.set("k", "v");
 
   const auto parsed = cachex::parse_command("SET k v 0");
@@ -224,7 +224,7 @@ CACHEX_TEST(execute_applies_a_ttl_of_zero_as_a_delete) {
 }
 
 CACHEX_TEST(a_plain_set_clears_an_existing_ttl_over_the_wire_too) {
-  cachex::SyncCache cache;
+  cachex::ShardedCache cache{1};
   const auto run = [&cache](const std::string& line) {
     const auto parsed = cachex::parse_command(line);
     return cachex::execute(cache, parsed.command);

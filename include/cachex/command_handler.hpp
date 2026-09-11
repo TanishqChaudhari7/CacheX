@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "cachex/sync_cache.hpp"
+#include "cachex/sharded_cache.hpp"
 #include "cachex/protocol.hpp"
 
 namespace cachex {
@@ -17,8 +17,10 @@ namespace cachex {
 /// The direction of the dependency is the point: networking calls the cache, and
 /// the cache knows nothing about any of this.
 ///
-/// Takes a SyncCache, not a Cache, so the type system rules out handing the
-/// server an unsynchronised cache.
-std::string execute(SyncCache& cache, const Command& command);
+/// Takes a ShardedCache, not a Cache, so the type system rules out handing the
+/// server an unsynchronised cache. ShardedCache exposes exactly the same API as
+/// SyncCache, so nothing here knows or cares how many shards there are --
+/// changing the shard count does not touch a line of the network layer.
+std::string execute(ShardedCache& cache, const Command& command);
 
 }  // namespace cachex
