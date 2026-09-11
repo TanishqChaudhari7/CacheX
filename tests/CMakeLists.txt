@@ -7,6 +7,7 @@ add_executable(cachex_tests
   line_buffer_test.cpp
   protocol_test.cpp
   server_test.cpp
+  concurrency_test.cpp
   version_test.cpp)
 
 # The test framework header sits next to the test sources.

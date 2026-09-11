@@ -7,7 +7,7 @@
 #include <string>
 #include <thread>
 
-#include "cachex/cache.hpp"
+#include "cachex/sync_cache.hpp"
 #include "cachex/line_buffer.hpp"
 #include "cachex/protocol.hpp"
 #include "cachex/socket.hpp"
@@ -42,7 +42,7 @@ class ServerFixture {
 
   bool started() const { return started_; }
   std::uint16_t port() const { return server_.bound_port(); }
-  cachex::Cache& cache() { return cache_; }
+  cachex::SyncCache& cache() { return cache_; }
   const cachex::Server& server() const { return server_; }
 
  private:
@@ -53,7 +53,7 @@ class ServerFixture {
     return opts;
   }
 
-  cachex::Cache cache_;
+  cachex::SyncCache cache_;
   cachex::Server server_;
   std::thread thread_;
   bool started_ = false;

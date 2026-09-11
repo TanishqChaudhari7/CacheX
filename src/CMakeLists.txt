@@ -10,6 +10,8 @@ configure_file(
 #
 # Knows nothing about sockets, and must stay that way. The dependency runs one
 # way only: networking calls the cache.
+find_package(Threads REQUIRED)
+
 add_library(cachex_core
   cache.cpp
   recency_list.cpp
@@ -21,6 +23,9 @@ target_include_directories(cachex_core PUBLIC
 
 # PRIVATE: warning flags are our build's business, not part of the library's
 # public interface.
+# PUBLIC: SyncCache's mutex is part of the public header, so anything using the
+# cache concurrently needs the threading library too.
+target_link_libraries(cachex_core PUBLIC Threads::Threads)
 target_link_libraries(cachex_core PRIVATE cachex_warnings)
 
 # --- The network layer ------------------------------------------------------

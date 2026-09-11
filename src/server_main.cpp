@@ -1,9 +1,10 @@
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 
-#include "cachex/cache.hpp"
+#include "cachex/sync_cache.hpp"
 #include "cachex/server.hpp"
 #include "cachex/version.hpp"
 
@@ -48,11 +49,15 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  cachex::Cache cache = capacity > 0 ? cachex::Cache(capacity) : cachex::Cache();
+  // unique_ptr because SyncCache holds a mutex and so is neither copyable nor
+  // movable -- the two constructors cannot be selected with a ternary.
+  const auto cache = capacity > 0
+                         ? std::make_unique<cachex::SyncCache>(capacity)
+                         : std::make_unique<cachex::SyncCache>();
 
   cachex::Server::Options options;
   options.port = port;
-  cachex::Server server(cache, options);
+  cachex::Server server(*cache, options);
 
   std::string error;
   if (!server.start(error)) {
@@ -70,13 +75,14 @@ int main(int argc, char** argv) {
             << (capacity > 0 ? std::to_string(capacity) + " entries"
                              : std::string("unbounded"))
             << "\n"
-            << "one client at a time (concurrency is Stage 7)\n"
+            << "thread-per-connection, max " << options.max_connections
+            << " concurrent clients\n"
             << "press Ctrl-C to stop\n"
             << std::flush;
 
   server.run();
 
   std::cout << "\n[cachex] shutting down after " << server.connections_served()
-            << " connection(s); " << cache.size() << " entries in cache\n";
+            << " connection(s); " << cache->size() << " entries in cache\n";
   return 0;
 }

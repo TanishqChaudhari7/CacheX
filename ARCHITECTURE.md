@@ -1,7 +1,7 @@
 # CacheX — Architecture
 
 > Living document. It is updated at every stage of the project.
-> **Current stage: 5 — TCP server and wire protocol.**
+> **Current stage: 6 — concurrency (thread-per-connection + one mutex).**
 
 | Legend | |
 | --- | --- |
@@ -47,7 +47,7 @@ the handful of things that demonstrate the concepts, and nothing more.
 | Measurement | Benchmark harness: throughput, average latency, percentiles, hit rate | ✅ Stage 3–4 |
 | Active expiry | Background sweep of expired keys | ⬜ after Stage 8 |
 | Networking | Single-node TCP server, line-based text protocol | ✅ Stage 5 |
-| Concurrency | Multiple clients served safely and, where possible, in parallel | ⬜ Stage 8 |
+| Concurrency | Multiple clients served safely and, where possible, in parallel | ✅ Stage 6 |
 | Length-prefixed framing | Keys/values containing whitespace or binary data | ⬜ future |
 | Sharding | Cache split into independently locked shards | ⬜ Stage 9 |
 | Persistence | Snapshot/restore so state survives a restart | ⬜ Stage 10 |
@@ -206,7 +206,7 @@ exactly a hash table: average O(1), independent of how many keys are stored.
 **Its weaknesses, stated honestly** — these are the follow-up questions:
 
 - O(1) is *average*, not worst case. Adversarial keys that all hash to one bucket degrade it to O(n). Real caches on untrusted input mitigate this with a randomly seeded hash; CacheX assumes a trusted network (§2), so it does not.
-- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§10).
+- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§11).
 - Growth rehashes every element, so an individual `set` can be O(n) even though the amortised cost is O(1). A *bounded* cache reaches its final bucket count and then stops rehashing, so in the steady state this stops happening at all — one of the quieter benefits of adding capacity.
 
 ### 4.4 Why a doubly linked list
@@ -404,7 +404,7 @@ comparison. One `time_point` answers "is this expired?" with a single `<=`.
 state from any deadline, not a magic value of one. It also buys the performance
 property that matters most: `has_value()` is checked *first*, so an entry without
 a TTL never reads the clock at all. That short-circuit is why TTL is nearly free
-for keys that do not use it — and §10 measures exactly how much it costs for keys
+for keys that do not use it — and §11 measures exactly how much it costs for keys
 that do.
 
 `ttl()` returns a small tagged type rather than an integer:
@@ -846,12 +846,189 @@ accept loop polls so a caller on another thread can shut it down. `accept()`
 blocks indefinitely, which would make the server unstoppable, so the loop waits
 on `poll()` with a 100 ms timeout and re-checks the flag. Exactly one thread ever
 touches the cache.
+---
+
+## 8. Concurrency
+
+### 8.1 The model: thread-per-connection + one mutex
+
+```
+   client 1 ──┐                          ┌─ worker thread 1 ─┐
+   client 2 ──┤    accept loop           ├─ worker thread 2 ─┤
+   client 3 ──┤  (its own thread,        ├─ worker thread 3 ─┤
+     ...      │   only accepts)          │       ...         │
+   client N ──┘         │                └─ worker thread N ─┘
+                        │                          │
+                   spawns one ───────────────────► │  all N threads
+                   thread per                      │  share ONE cache
+                   connection                      ▼
+                                     ┌──────────────────────────┐
+                                     │  SyncCache               │
+                                     │  ┌────────────────────┐  │
+                                     │  │  std::mutex        │  │ ◄── the only
+                                     │  └────────────────────┘  │     shared
+                                     │  Cache                   │     state
+                                     │   ├─ unordered_map       │
+                                     │   └─ RecencyList         │
+                                     └──────────────────────────┘
+```
+
+Each connection gets its own thread. Everything a worker touches is private to it
+— its `Socket`, its `LineBuffer`, its parsed `Command` — **except the cache**,
+which is shared by all of them and guarded by a single mutex.
+
+Thread-per-connection is the simplest model that actually works, which is why it
+is the baseline. It does not scale to many thousands of connections: each thread
+costs a stack and a scheduler slot, so `Options::max_connections` (default 256)
+caps it and a client arriving past the limit is refused politely rather than
+being allowed to exhaust memory.
+
+### 8.2 Mutex ownership and critical sections
+
+The mutex lives **inside `SyncCache`**, not in the server, and never leaves it.
+Callers cannot lock, unlock, or forget to. Each public method is one critical
+section: take the lock, delegate to the single-threaded `Cache`, release.
+
+```cpp
+std::optional<std::string> get(const std::string& key) {
+  const std::lock_guard<std::mutex> lock(mutex_);   // critical section starts
+  return cache_.get(key);
+}                                                   // ...and ends here, always
+```
+
+`lock_guard` means the lock is released on every path out, including an
+exception. The critical section is exactly one cache operation — small, fixed,
+and containing no I/O. **No socket call ever happens while the lock is held**,
+which is what keeps a slow or dead client from blocking every other client.
+
+`Cache` itself is untouched and still single-threaded. Keeping the mutex in a
+wrapper means the engine pays nothing in the in-process benchmarks, and the
+locking is visible in one file instead of scattered through the data structure.
+
+A second, much smaller mutex (`Server::workers_mutex_`) guards only the vector of
+worker threads. It is never held while serving a connection, and never held at
+the same time as the cache mutex — two locks that can never be taken together
+cannot deadlock.
+
+### 8.3 Why GET needs an exclusive lock
+
+This is the part that catches people out.
+
+**Under LRU, a read is a write.** `get()` does not merely look a key up:
+
+1. it splices the entry to the head of the recency list — three pointer updates to shared memory;
+2. if the entry has expired, it *deletes* it from both the map and the list.
+
+So two threads "just reading" are two threads mutating the same linked list. Left
+unguarded, that is a classic corrupted list: nodes lost, cycles created, or a
+node freed while another thread walks through it.
+
+This is not theoretical. Running the unsynchronised `Cache` from four threads
+under ThreadSanitizer produced **92 data-race reports** and then hung — a
+corrupted list had become a cycle. §8.4 has the detail.
+
+The consequence for design: **`std::shared_mutex` would buy almost nothing
+here.** Readers can only share a lock if they are genuinely read-only, and in a
+cache the common operation is `get` — which is a writer. Only `contains` and
+`size` could take a shared lock, and they are the rare ones. That is worth
+knowing before reaching for a reader/writer lock as an "obvious" improvement.
+
+### 8.4 Race conditions, and what the lock does not fix
+
+`SyncCache` makes every **individual operation** atomic. It does not make
+**sequences** of operations atomic, and the difference matters:
+
+```cpp
+int n = std::stoi(cache.get("counter").value_or("0"));   // ← another thread
+cache.set("counter", std::to_string(n + 1));             //   can run here
+```
+
+Two threads can read the same value and both write back the same increment, so
+one update is lost. This is a lost-update race and it survives a perfectly
+thread-safe cache. `tests/concurrency_test.cpp` asserts the bug rather than
+hiding it, because it is an honest statement of the contract. Fixing it needs a
+compound operation *inside* the lock (an `INCR` command) or a compare-and-swap —
+not a bigger mutex.
+
+**Verification.** The suite runs under ThreadSanitizer with zero warnings. That
+result is only meaningful if TSan would catch a race in this code, so that was
+checked directly: a four-thread probe against the raw, unsynchronised `Cache`
+reported 92 races — pointing at `cache.cpp:58`, the `index_.emplace` that
+triggers a rehash — and then hung. The tooling works; the clean run is real.
+
+### 8.5 Thread lifecycle
+
+```
+  accept() returns a socket
+        │
+        ├─► spawn_worker(): create thread, push {thread, finished flag} onto workers_
+        │        │
+        │        └─► worker: Connection(socket, cache).serve()
+        │                      ... reads commands until the client goes away ...
+        │                    set finished = true       ← last thing it does
+        │
+        ├─► each accept-loop iteration: reap_finished_workers()
+        │        join() and erase every worker whose flag is set
+        │
+        └─► stop() → loop exits → join_all_workers()
+```
+
+Workers are **joined, never detached**. A detached worker holds a reference to
+the cache and could outlive it, which is a use-after-free waiting for a shutdown
+to happen at the wrong moment. Joining means `run()` cannot return until every
+worker is finished.
+
+`std::thread` cannot be asked "are you done?", so each worker sets a shared
+`atomic<bool>` on its way out and the accept loop reaps the finished ones. The
+flag is set **last**, after everything else the thread does, because once it is
+true the accept loop may join and destroy that `Worker` entry.
+
+`join_all_workers()` swaps the vector out under the lock and joins *outside* it —
+joining while holding `workers_mutex_` could block on a worker that is itself
+trying to take that mutex.
+
+### 8.6 Bottlenecks — measured, not assumed
+
+The obvious story is "one global mutex serialises everything, so that is the
+bottleneck". **The measurements say otherwise**, and the benchmark includes two
+controls specifically to test it.
+
+| clients | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| **PING** — takes no lock at all | 1.00x | 1.66x | 1.76x | 2.41x | 2.46x |
+| **GET** — takes the lock | 1.00x | 1.77x | 1.88x | 2.53x | 2.54x |
+| **SET** — takes the lock | 1.00x | 1.82x | 1.97x | 2.56x | 2.66x |
+
+`PING` touches no cache data and takes no lock, yet it plateaus in the same
+place. **So over TCP the mutex is not what limits scaling** — the transport,
+syscalls and scheduler are. That follows from Stage 5's finding that a round trip
+is ~20 µs while the cache operation is ~0.4 µs: a 2% serial section cannot cap
+speedup at 2.5x.
+
+Remove the network, though, and the mutex has nowhere to hide:
+
+| threads calling `SyncCache::get()` directly | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| scaling | 1.00x | 0.83x | 0.48x | 0.61x | 0.70x |
+
+**Adding threads makes it slower.** Throughput never exceeds the single-threaded
+figure, because the lock admits exactly one thread at a time and the extra
+threads only add contention and handoff cost. That is what a hard sequential
+section looks like, and it is the real argument for sharding: not that the lock
+is slow today, but that it is a wall the system will hit the moment the transport
+stops being the limit.
+
+The third signature to recognise: across all three TCP tables, **p50 latency
+rises roughly in proportion to client count (20 µs → 128 µs at 16) while
+throughput stays flat**. Growing queue, constant service rate — the definition of
+a saturated resource.
+
 
 
 
 ---
 
-## 8. Complexity
+## 9. Complexity
 
 All bounds assume a hash function that distributes keys reasonably.
 
@@ -876,20 +1053,20 @@ always `entries_.oldest()` — the tail of the list — reachable in constant ti
 and expiry is only ever checked on an entry an operation is already holding.
 
 **Space: O(n)**, bounded by `capacity` once one is set. Per entry, roughly:
-the key twice (§9), the value once, two list pointers, and the map's node and
+the key twice (§10), the value once, two list pointers, and the map's node and
 bucket overhead. For a 16-byte key and a 64-byte value that is an estimated
 ~180–200 bytes for ~80 bytes of payload. ⬜ *That figure is an estimate from the
 data layout, not a measurement; measuring it properly is Stage 11 work.*
 
 A caveat that matters more than the table: **every operation here is O(1), and
-they still differ by roughly 10× in measured cost** (§10). The constant factors —
+they still differ by roughly 10× in measured cost** (§11). The constant factors —
 allocation, copying, and memory locality — dominate at this scale. The table is
 the right answer to "how does this scale?" and the wrong answer to "which is
 fastest?".
 
 ---
 
-## 9. Ownership and Lifetime
+## 10. Ownership and Lifetime
 
 This is where a cache of this shape goes wrong, so it is worth being precise.
 
@@ -977,7 +1154,7 @@ tests pin this (`get_missing_key_returns_nullopt`,
 
 ---
 
-## 10. Benchmark Methodology
+## 11. Benchmark Methodology
 
 Source: `benchmarks/cache_benchmark.cpp`. Results: `benchmarks/RESULTS.md`.
 
@@ -1087,7 +1264,7 @@ Headline findings from the Stage 3 run:
 
 ---
 
-## 11. Current Components
+## 12. Current Components
 
 | Path | Purpose | Status |
 | --- | --- | --- |
@@ -1098,7 +1275,8 @@ Headline findings from the Stage 3 run:
 | `include/cachex/socket.hpp` | RAII file-descriptor owner, `send_all` | ✅ |
 | `include/cachex/command_handler.hpp` | `execute(Cache&, Command)` — the bridge | ✅ |
 | `include/cachex/connection.hpp` | One client's read/dispatch/write loop | ✅ |
-| `include/cachex/server.hpp` | Listening socket and accept loop | ✅ |
+| `include/cachex/server.hpp` | Listening socket, accept loop, worker threads | ✅ |
+| `include/cachex/sync_cache.hpp` | Thread-safe wrapper: one mutex around Cache | ✅ |
 | `src/net/` | Implementations of the above | ✅ |
 | `src/server_main.cpp`, `src/client_main.cpp` | `cachex_server`, `cachex_client` | ✅ |
 | `docs/PROTOCOL.md` | The wire protocol specification | ✅ |
@@ -1111,6 +1289,7 @@ Headline findings from the Stage 3 run:
 | `tests/line_buffer_test.cpp` | Framing: split reads, batched reads, CRLF | ✅ |
 | `tests/protocol_test.cpp` | Parser and reply formatting, no sockets | ✅ |
 | `tests/server_test.cpp` | Integration: a real server over a real socket | ✅ |
+| `tests/concurrency_test.cpp` | Parallel readers/writers, mixed workloads, many clients | ✅ |
 | `tests/recency_list_test.cpp` | Ordering and iterator stability | ✅ |
 | `benchmarks/` | `cachex_bench` + `RESULTS.md`; off by default | ✅ |
 | `docs/` | Longer-form notes | — |
@@ -1150,9 +1329,9 @@ server will run.
 
 ---
 
-## 12. Design Decisions
+## 13. Design Decisions
 
-### 12.1 Why C++17 rather than C++20
+### 13.1 Why C++17 rather than C++20
 
 C++17 already contains everything this project needs, and Stage 3 leans on
 `std::optional` twice — once for a lookup that may miss, once for a capacity that
@@ -1167,7 +1346,7 @@ their machine.
 | `std::format` | Convenience only; library support is still uneven. |
 | Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It does not bite yet, but it will when the protocol parser hands over views into a socket buffer (Stage 7). The fix is a transparent hash functor, not a language upgrade. |
 
-### 12.2 Why CMake
+### 13.2 Why CMake
 
 The de-facto standard for C++, so it is what reviewers expect and what IDEs,
 `clangd`, sanitizers, and CI already understand. It makes Debug/Release a
@@ -1175,7 +1354,7 @@ configuration flag rather than hand-maintained compiler invocations. The CMake
 here is **target-based**: properties attach to targets rather than directory-wide
 globals, so include paths and flags travel with the target that needs them.
 
-### 12.3 Why warnings are an INTERFACE target
+### 13.3 Why warnings are an INTERFACE target
 
 `cachex_warnings` carries no code, only flags; targets opt in by linking it.
 Appending to global `CMAKE_CXX_FLAGS` would apply them to any third-party library
@@ -1185,7 +1364,7 @@ past is how a real warning in our own code gets missed.
 `-Werror` is available (`-DCACHEX_WARNINGS_AS_ERRORS=ON`) but off by default, so a
 new compiler version with a new warning cannot break someone's clone.
 
-### 12.4 Why the test framework is hand-written
+### 13.4 Why the test framework is hand-written
 
 ~100 lines of header, no dependency. Only three capabilities are needed: register
 a test, assert a condition, exit non-zero. GoogleTest or Catch2 would be the
@@ -1199,7 +1378,7 @@ a namespace-scope registry could be registered *into* before it was constructed.
 A function-local static is constructed on first use. This is the *static
 initialisation order fiasco*.
 
-### 12.5 Why the tests run under sanitizers
+### 13.5 Why the tests run under sanitizers
 
 The correctness of this design rests on a claim about iterator validity, and
 nothing in the type system enforces it. A dangling `std::list` iterator will
@@ -1216,14 +1395,14 @@ cmake --build build/asan -j --target cachex_tests && ./build/asan/bin/cachex_tes
 leaks --atExit -- ./build/debug/bin/cachex_tests
 ```
 
-### 12.6 Why the version header is generated
+### 13.6 Why the version header is generated
 
 `configure_file()` expands `include/cachex/version.hpp.in` into the build
 directory, substituting the version from `project()`. Otherwise the version lives
 in two places and drifts. The generated header goes in the build tree, never the
 source tree.
 
-### 12.7 Why `build/` is not committed
+### 13.7 Why `build/` is not committed
 
 Build output is reproducible from the sources, specific to one compiler and one
 machine, goes stale the instant a flag changes, and makes every diff unreadable.
@@ -1231,7 +1410,7 @@ Commit the inputs, never the outputs.
 
 ---
 
-## 13. Interview Questions I Should Be Able To Answer
+## 14. Interview Questions I Should Be Able To Answer
 
 ### Why not use only a hash map?
 
@@ -1379,7 +1558,7 @@ it rejects `SET ... EX 0` as an error, and uses `EXPIRE key 0` for the delete.
 ~12% of a GET hit, measured — about 12 ns, which is one `steady_clock::now()`
 read. Keys *without* a TTL pay none of it, because the `optional` is tested
 before the clock is read. That short-circuit is the whole reason TTL is close to
-free for keys that do not use it. §10.
+free for keys that do not use it. §11.
 
 ### How would you test something that depends on time without flaky tests?
 
@@ -1486,6 +1665,78 @@ are testable in-process.
 It is enforced by the build graph, not discipline: `cachex_core` does not link
 `cachex_net`, so cache code that reached for a socket would fail to link.
 
+### Race condition vs deadlock?
+
+A **race condition** is unsynchronised concurrent access where the result depends
+on timing — two threads splicing the same list node, and the outcome is a
+corrupted list. The program does too little synchronisation.
+
+A **deadlock** is two or more threads each waiting for a lock the other holds, so
+none can proceed. The program does too much synchronisation, in the wrong order.
+
+They pull in opposite directions, which is why fixing one carelessly causes the
+other. CacheX avoids deadlock structurally: there are two mutexes
+(`SyncCache::mutex_` and `Server::workers_mutex_`) and **they are never held at
+the same time**. Two locks that cannot be held together cannot deadlock, and that
+is much easier to verify than a lock-ordering rule.
+
+### Mutex vs atomic?
+
+An **atomic** makes a single operation on a single variable indivisible, with no
+blocking. Use it for a counter or a flag — `connections_served_`,
+`stop_requested_`.
+
+A **mutex** protects an arbitrary *region of code* touching arbitrary state. Use
+it when an invariant spans several variables. That is exactly the cache: a map
+and a list that must agree with each other. No number of atomics would help,
+because the invariant is between structures, not inside one word. Atomics are
+cheaper; mutexes are more general.
+
+### Why does one global mutex become a bottleneck?
+
+Because it makes the whole cache a **sequential section**: exactly one thread may
+be inside it, so the cache's throughput is capped at what one core can do
+regardless of how many threads exist. Amdahl's law then bounds the whole system.
+
+The measurement is blunt: N threads calling `SyncCache::get()` directly scale
+1.00x → 0.83x → 0.48x at 1, 2 and 4 threads. Adding threads makes it **slower**,
+because they queue and pay handoff cost on top.
+
+The nuance worth knowing — and the thing the benchmark's control proves — is that
+*over TCP this is not yet the limit*. Lock-free `PING` plateaus at the same place
+as `GET`, because a ~20 µs round trip dwarfs a ~0.4 µs cache operation. The mutex
+is a wall the system will hit once the transport stops being the bottleneck, not
+one it is hitting today. §8.6.
+
+### Why does LRU make GET a write operation?
+
+Because "least recently used" has to be maintained, and the only moment the cache
+learns a key was used is when someone reads it. So `get()` splices that entry to
+the head of the recency list — and if it has expired, deletes it from both
+structures. Two concurrent "reads" are two concurrent list mutations.
+
+That is why `get()` takes an **exclusive** lock, and why `std::shared_mutex` is a
+trap here: readers can only share a lock if they are genuinely read-only, and in
+a cache the common operation is a reader that writes.
+
+### What happens with 100 concurrent clients?
+
+With thread-per-connection: 100 worker threads, each with its own stack,
+competing for 12 hardware threads. They are accepted — the default
+`max_connections` is 256 — and the 257th would be refused with an error rather
+than allowed to exhaust memory.
+
+What the measurements predict: **throughput stays flat at roughly the 8-client
+figure (~120k req/sec) while latency grows in proportion.** That is what the
+1→16 client data already shows (p50 20 µs → 128 µs while throughput plateaus),
+and it is the signature of a saturated resource: the queue grows, the service
+rate does not. Clients experience it as latency, not as errors.
+
+Beyond a few hundred, thread-per-connection stops being viable at all — context
+switching and stack memory dominate. The answer is an event loop (a handful of
+threads multiplexing many sockets with `epoll`/`kqueue`), and separately sharding
+the cache so the lock stops being one sequential section.
+
 ### How would you test that eviction is correct?
 
 Not by checking `size()` — that passes even if the *wrong* entry is evicted. The
@@ -1496,7 +1747,7 @@ test that verifies the map and the list still agree on which keys exist.
 
 ---
 
-## 14. Future Roadmap
+## 15. Future Roadmap
 
 **Everything below is ⬜ future work.**
 
@@ -1507,17 +1758,17 @@ test that verifies the map and the list still agree on which keys exist.
 | 3 | LRU eviction | Capacity limit, O(1) eviction, workload benchmarks | Why O(1) LRU needs both structures; hit rate | ✅ |
 | 4 | TTL | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
 | 5 | **TCP server + protocol** | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
-| 6 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
-| 7 | Concurrency | Many clients at once — thread pool or event loop | Data races, why `shared_mutex` disappoints for LRU | ⬜ |
+| 6 | **Concurrency** | Thread-per-connection, SyncCache, scaling benchmark | Data races, mutexes, contention, why `shared_mutex` disappoints for LRU | ✅ |
+| 7 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
 | 8 | Sharded cache | N independently locked shards | Lock contention as the real bottleneck | ⬜ |
 | 9 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
 | 10 | Persistence | Snapshot to disk, restore on startup | Serialisation; durability vs. throughput | ⬜ |
 | 11 | Final optimisation | Profile, tune, re-benchmark against the recorded baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
 
-Stage numbering note: concurrency and sharding moved up one, and active expiry
-slotted in after them, because active expiry cannot safely precede thread safety
-(§6.5). Earlier documents referred to concurrency as "Stage 8"; the ordering is
-what matters, not the number.
+Stage numbering note: active expiry sits after concurrency and sharding because
+it cannot safely precede thread safety (§6.5). Earlier documents referred to
+concurrency as "Stage 7" or "Stage 8"; the ordering is what matters, not the
+number.
 
-Each stage ends with this document updated: components in §11, decisions in §12,
-new questions in §13, and the diagram in §3 grown to match what actually exists.
+Each stage ends with this document updated: components in §12, decisions in §13,
+new questions in §14, and the diagram in §3 grown to match what actually exists.

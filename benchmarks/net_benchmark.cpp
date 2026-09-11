@@ -1,15 +1,18 @@
 #include <sys/socket.h>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "bench_util.hpp"
-#include "cachex/cache.hpp"
+#include "cachex/sync_cache.hpp"
 #include "cachex/line_buffer.hpp"
 #include "cachex/server.hpp"
 #include "cachex/socket.hpp"
@@ -19,7 +22,12 @@ namespace {
 using bench::Clock;
 using bench::Nanos;
 
-constexpr std::size_t kRequests = 20000;  // per phase
+constexpr std::size_t kRequests = 20000;  // per phase, single-client section
+
+// Divisible by every client count below, so each configuration performs exactly
+// the same total work and the throughputs are directly comparable.
+constexpr std::size_t kTotalRequests = 32000;
+constexpr int kClientCounts[] = {1, 2, 4, 8, 16};
 constexpr std::size_t kValueBytes = 64;
 
 /// A blocking, one-request-at-a-time client -- no pipelining, no concurrency.
@@ -61,6 +69,115 @@ class BenchClient {
   cachex::Socket socket_;
   cachex::LineBuffer replies_;
 };
+
+/// Releases every client thread at the same instant.
+///
+/// Without this the first client would start (and finish) while the last was
+/// still opening its socket, so a "16 client" run would spend part of its time
+/// with far fewer than 16 clients actually in flight -- and would understate
+/// contention exactly where the benchmark is trying to measure it.
+class StartGate {
+ public:
+  explicit StartGate(int participants) : remaining_(participants) {}
+
+  /// Called by each worker once it is connected and ready.
+  void arrive_and_wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (--remaining_ == 0) {
+      ready_.notify_all();
+    }
+    ready_.wait(lock, [this] { return remaining_ == 0; });
+    go_.wait(lock, [this] { return released_; });
+  }
+
+  /// Blocks until every worker has arrived.
+  void wait_until_all_ready() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ready_.wait(lock, [this] { return remaining_ == 0; });
+  }
+
+  void release() {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    go_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::condition_variable go_;
+  int remaining_;
+  bool released_ = false;
+};
+
+struct ConcurrentResult {
+  Nanos wall{0};
+  bench::Latency latency;
+  std::size_t requests = 0;
+  std::size_t failures = 0;
+};
+
+/// Runs `clients` connections in parallel, each issuing the same number of
+/// requests, and reports aggregate throughput plus the merged latency
+/// distribution across every request from every client.
+ConcurrentResult run_concurrent(
+    std::uint16_t port, int clients, std::size_t requests_per_client,
+    const std::function<std::string(int, std::size_t)>& make_command) {
+  StartGate gate(clients);
+  std::vector<std::vector<std::int64_t>> per_client(
+      static_cast<std::size_t>(clients));
+  std::vector<std::size_t> failures(static_cast<std::size_t>(clients), 0);
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(clients));
+
+  for (int c = 0; c < clients; ++c) {
+    threads.emplace_back([&, c] {
+      BenchClient client(port);
+      std::vector<std::int64_t>& samples = per_client[static_cast<std::size_t>(c)];
+      samples.reserve(requests_per_client);
+
+      // Connect first, then wait: connection setup must not land inside the
+      // timed window.
+      gate.arrive_and_wait();
+
+      for (std::size_t i = 0; i < requests_per_client; ++i) {
+        const std::string command = make_command(c, i);
+        const auto start = Clock::now();
+        const char tag = client.round_trip(command);
+        const auto end = Clock::now();
+        samples.push_back(std::chrono::duration_cast<Nanos>(end - start).count());
+        if (tag == '!' || tag == '-') {
+          ++failures[static_cast<std::size_t>(c)];
+        }
+      }
+    });
+  }
+
+  gate.wait_until_all_ready();
+  const auto wall_start = Clock::now();
+  gate.release();
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  const auto wall_end = Clock::now();
+
+  ConcurrentResult result;
+  result.wall = std::chrono::duration_cast<Nanos>(wall_end - wall_start);
+  result.requests = requests_per_client * static_cast<std::size_t>(clients);
+
+  std::vector<std::int64_t> merged;
+  merged.reserve(result.requests);
+  for (const auto& samples : per_client) {
+    merged.insert(merged.end(), samples.begin(), samples.end());
+  }
+  for (const std::size_t f : failures) {
+    result.failures += f;
+  }
+  result.latency = bench::summarize(merged);
+  return result;
+}
 
 struct PhaseResult {
   Nanos total{0};
@@ -127,7 +244,7 @@ int main() {
   // benchmark a single self-contained binary and removes any question of which
   // build of the server is being measured -- but it does mean the numbers
   // include no real network, only the loopback path through the kernel.
-  cachex::Cache cache;
+  cachex::SyncCache cache;
   cachex::Server::Options options;
   options.port = 0;  // let the OS pick a free port
   options.verbose = false;
@@ -203,7 +320,154 @@ int main() {
         << "\n  entries in cache: " << cache.size()
         << "   checksum: " << (ping.checksum + set.checksum + get.checksum)
         << "\n";
-  }  // the client disconnects here, freeing the server's accept loop
+  }  // the single client disconnects here
+
+  // ======================================================================
+  // Concurrency scaling. Every configuration performs the same total work, so
+  // throughput is directly comparable and the scaling factor is meaningful.
+  // ======================================================================
+  {
+    const std::string value(kValueBytes, 'v');
+
+    // Pre-populate so the GET phase hits. Done before any timing.
+    for (std::size_t i = 0; i < kTotalRequests; ++i) {
+      cache.set(pad_key(i), value);
+    }
+
+    const auto run_scaling = [&](const char* name,
+                                 const std::function<std::string(int, std::size_t)>&
+                                     make_command) {
+      std::cout << "\n" << name << " -- " << kTotalRequests
+                << " total requests, split across N clients\n\n"
+                << std::left << std::setw(9) << "clients" << std::right
+                << std::setw(11) << "per client" << std::setw(13) << "req/sec"
+                << std::setw(10) << "scaling" << std::setw(11) << "p50 (us)"
+                << std::setw(10) << "p95" << std::setw(10) << "p99"
+                << std::setw(11) << "errors" << "\n"
+                << std::string(84, '-') << "\n";
+
+      double baseline = 0.0;
+      for (const int clients : kClientCounts) {
+        const std::size_t per_client =
+            kTotalRequests / static_cast<std::size_t>(clients);
+        const ConcurrentResult result =
+            run_concurrent(server.bound_port(), clients, per_client, make_command);
+
+        const double throughput = bench::ops_per_sec(result.wall, result.requests);
+        if (clients == kClientCounts[0]) {
+          baseline = throughput;
+        }
+        std::cout << std::left << std::setw(9) << clients << std::right
+                  << std::setw(11) << per_client << std::setw(13) << std::fixed
+                  << std::setprecision(0) << throughput << std::setw(9)
+                  << std::setprecision(2)
+                  << (baseline > 0.0 ? throughput / baseline : 0.0) << "x"
+                  << std::setw(11) << std::setprecision(2)
+                  << result.latency.p50 / 1000.0 << std::setw(10)
+                  << result.latency.p95 / 1000.0 << std::setw(10)
+                  << result.latency.p99 / 1000.0 << std::setw(11)
+                  << result.failures << "\n";
+      }
+    };
+
+    std::cout << "\n\nCONCURRENCY SCALING\n"
+              << "===================\n"
+              << "server: thread-per-connection, one std::mutex around the cache\n"
+              << "note:   clients and server share this machine's "
+              << std::thread::hardware_concurrency()
+              << " hardware threads, so past\n"
+              << "        that point they compete with each other for CPU.\n";
+
+    // Control. PING takes no lock and touches no cache data, so whatever
+    // ceiling it hits is the transport's, not the cache's. If PING scales like
+    // GET, the mutex is not what is limiting either of them.
+    run_scaling("PING (control: no lock, no cache access)",
+                [](int, std::size_t) { return std::string("PING\n"); });
+
+    run_scaling("GET (all hits)", [&](int, std::size_t i) {
+      return "GET " + pad_key(i) + "\n";
+    });
+
+    run_scaling("SET", [&value](int client, std::size_t i) {
+      // Distinct key space per client, so this measures lock contention rather
+      // than clients overwriting each other.
+      return "SET c" + std::to_string(client) + ":" + pad_key(i) + " " + value +
+             "\n";
+    });
+
+    // ====================================================================
+    // The same scaling question with the network removed entirely: N threads
+    // calling SyncCache::get() directly. This is the mutex on its own, with
+    // nothing to hide behind.
+    // ====================================================================
+    std::cout << "\n\nIN-PROCESS LOCK CONTENTION (no sockets)\n"
+              << "N threads calling SyncCache::get() directly, "
+              << kTotalRequests << " total calls\n\n"
+              << std::left << std::setw(9) << "threads" << std::right
+              << std::setw(13) << "ops/sec" << std::setw(10) << "scaling"
+              << std::setw(13) << "ns/op" << "\n"
+              << std::string(45, '-') << "\n";
+
+    double lock_baseline = 0.0;
+    std::uint64_t lock_checksum = 0;
+    for (const int threads : kClientCounts) {
+      const std::size_t per_thread =
+          kTotalRequests / static_cast<std::size_t>(threads);
+      StartGate gate(threads);
+      std::vector<std::thread> workers;
+      workers.reserve(static_cast<std::size_t>(threads));
+      std::atomic<std::uint64_t> sink{0};
+
+      for (int w = 0; w < threads; ++w) {
+        workers.emplace_back([&, w] {
+          gate.arrive_and_wait();
+          std::uint64_t local = 0;
+          for (std::size_t i = 0; i < per_thread; ++i) {
+            if (const auto found = cache.get(pad_key((i * 7 + static_cast<std::size_t>(w)) %
+                                                     kTotalRequests))) {
+              local += found->size();
+            }
+          }
+          sink.fetch_add(local);
+        });
+      }
+      gate.wait_until_all_ready();
+      const auto start = Clock::now();
+      gate.release();
+      for (std::thread& worker : workers) {
+        worker.join();
+      }
+      const auto elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
+      // Printed at the end, so the optimiser cannot delete the gets.
+      lock_checksum += sink.load();
+
+      const std::size_t total = per_thread * static_cast<std::size_t>(threads);
+      const double throughput = bench::ops_per_sec(elapsed, total);
+      if (threads == kClientCounts[0]) {
+        lock_baseline = throughput;
+      }
+      std::cout << std::left << std::setw(9) << threads << std::right
+                << std::setw(13) << std::fixed << std::setprecision(0)
+                << throughput << std::setw(9) << std::setprecision(2)
+                << (lock_baseline > 0.0 ? throughput / lock_baseline : 0.0) << "x"
+                << std::setw(13) << std::setprecision(1)
+                << bench::avg_ns(elapsed, total) << "\n";
+    }
+
+    std::cout << "\n  (checksum " << lock_checksum << ")\n"
+              << "\n  scaling = throughput at N / throughput at 1. Perfect would be Nx.\n"
+              << "\n  Read the three tables together before blaming anything:\n"
+              << "    * PING takes no lock at all. If it plateaus where GET and SET\n"
+              << "      plateau, the ceiling over TCP is the transport and the\n"
+              << "      scheduler, not the cache mutex.\n"
+              << "    * The in-process table is the mutex with nowhere to hide. A\n"
+              << "      figure at or below 1.00x there means the lock is pure\n"
+              << "      serialisation -- threads take turns, and the extra threads\n"
+              << "      only add handoff cost.\n"
+              << "    * Latency rising roughly in proportion to client count, while\n"
+              << "      throughput is flat, is the signature of a saturated\n"
+              << "      resource: the queue is growing, not the service rate.\n";
+  }
 
   server.stop();
   server_thread.join();

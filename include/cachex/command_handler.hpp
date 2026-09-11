@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "cachex/cache.hpp"
+#include "cachex/sync_cache.hpp"
 #include "cachex/protocol.hpp"
 
 namespace cachex {
@@ -16,6 +16,9 @@ namespace cachex {
 ///
 /// The direction of the dependency is the point: networking calls the cache, and
 /// the cache knows nothing about any of this.
-std::string execute(Cache& cache, const Command& command);
+///
+/// Takes a SyncCache, not a Cache, so the type system rules out handing the
+/// server an unsynchronised cache.
+std::string execute(SyncCache& cache, const Command& command);
 
 }  // namespace cachex

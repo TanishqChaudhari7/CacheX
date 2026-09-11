@@ -10,6 +10,8 @@
 #include <iostream>
 #include <utility>
 
+#include "cachex/protocol.hpp"
+
 #include "cachex/connection.hpp"
 
 namespace cachex {
@@ -21,7 +23,7 @@ constexpr int kAcceptPollMs = 100;
 
 }  // namespace
 
-Server::Server(Cache& cache, Options options)
+Server::Server(SyncCache& cache, Options options)
     : cache_(cache), options_(std::move(options)) {}
 
 bool Server::start(std::string& error) {
@@ -90,7 +92,7 @@ void Server::run() {
   while (!stop_requested_.load()) {
     // accept() blocks indefinitely, which would make the server unstoppable.
     // poll() with a timeout turns the wait into a bounded one so the loop can
-    // notice stop() between attempts.
+    // notice stop() between attempts -- and can reap finished workers.
     pollfd waiting{};
     waiting.fd = listener_.get();
     waiting.events = POLLIN;
@@ -102,6 +104,9 @@ void Server::run() {
       }
       break;
     }
+
+    reap_finished_workers();
+
     if (ready == 0) {
       continue;  // nothing waiting; re-check the stop flag
     }
@@ -117,22 +122,83 @@ void Server::run() {
     set_tcp_nodelay(client.get());
     set_no_sigpipe(client.get());
 
-    ++connections_served_;
-    if (options_.verbose) {
-      std::cout << "[cachex] client connected (#" << connections_served_ << ")\n"
-                << std::flush;
+    if (active_connections_.load() >= options_.max_connections) {
+      // Thread-per-connection means one more client is one more thread. Refuse
+      // politely rather than letting the thread count run away.
+      send_all(client.get(),
+               reply_error("server at connection limit (" +
+                           std::to_string(options_.max_connections) + ")"));
+      continue;  // client's destructor closes the socket
     }
 
-    Connection connection(std::move(client), cache_);
+    spawn_worker(std::move(client));
+  }
+
+  // The accept loop is done. Every worker holds a reference to cache_ and to
+  // this Server, so none of them may outlive run() returning.
+  join_all_workers();
+}
+
+void Server::spawn_worker(Socket client) {
+  auto finished = std::make_shared<std::atomic<bool>>(false);
+
+  const std::size_t id = connections_served_.fetch_add(1) + 1;
+  active_connections_.fetch_add(1);
+
+  if (options_.verbose) {
+    std::cout << "[cachex] client connected (#" << id << ", "
+              << active_connections_.load() << " active)\n"
+              << std::flush;
+  }
+
+  std::thread worker([this, socket = std::move(client), finished, id]() mutable {
+    Connection connection(std::move(socket), cache_);
     connection.serve();
 
     if (options_.verbose) {
-      std::cout << "[cachex] client disconnected after "
+      std::cout << "[cachex] client #" << id << " disconnected after "
                 << connection.commands_handled() << " command(s)\n"
                 << std::flush;
     }
-    // `connection` goes out of scope here, closing the client socket. Only now
-    // does the loop come back around to accept the next client.
+    active_connections_.fetch_sub(1);
+
+    // Set last: once this is true the accept loop may join and destroy this
+    // Worker, so nothing after it may touch the thread's own state.
+    finished->store(true);
+  });
+
+  const std::lock_guard<std::mutex> lock(workers_mutex_);
+  workers_.push_back(Worker{std::move(worker), std::move(finished)});
+}
+
+void Server::reap_finished_workers() {
+  const std::lock_guard<std::mutex> lock(workers_mutex_);
+  for (std::size_t i = 0; i < workers_.size();) {
+    if (workers_[i].finished->load()) {
+      // join() on an already-finished thread returns immediately; it is what
+      // releases the thread's resources. Detaching instead would mean a worker
+      // could outlive the Server and the cache it references.
+      workers_[i].thread.join();
+      workers_.erase(workers_.begin() + static_cast<std::ptrdiff_t>(i));
+    } else {
+      ++i;
+    }
+  }
+}
+
+void Server::join_all_workers() {
+  std::vector<Worker> remaining;
+  {
+    const std::lock_guard<std::mutex> lock(workers_mutex_);
+    remaining.swap(workers_);
+  }
+  // Joined outside the lock: a worker that finishes here would otherwise try to
+  // take workers_mutex_ through reap, and blocking a join on a lock the joining
+  // thread already holds is how deadlocks get written.
+  for (Worker& worker : remaining) {
+    if (worker.thread.joinable()) {
+      worker.thread.join();
+    }
   }
 }
 

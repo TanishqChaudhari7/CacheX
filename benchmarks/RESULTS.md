@@ -6,13 +6,121 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §10](../ARCHITECTURE.md#10-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §11](../ARCHITECTURE.md#11-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
 ./build/release/bin/cachex_bench
 ```
+
+---
+
+## Stage 6 — concurrency
+
+| | |
+| --- | --- |
+| Date | 2026-09-11 |
+| Machine | Apple M2 Pro, 12 cores / 12 hardware threads, 16 GB RAM |
+| OS | macOS 26.5.2 (arm64) |
+| Compiler | AppleClang 21.0.0, `-O3 -DNDEBUG`, C++17 |
+| Server | Thread-per-connection, one `std::mutex` around the cache |
+| Work | 32,000 total requests per configuration, split evenly across clients |
+
+All clients are released simultaneously by a start gate, so a "16 client" run
+really does have 16 clients in flight rather than a staggered ramp.
+
+### Scaling, 1 → 16 concurrent clients
+
+`scaling` = throughput(N clients) / throughput(1 client). Perfect would be N.
+
+**PING** — the control. Takes no lock, touches no cache data.
+
+| clients | per client | req/sec | scaling | p50 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32,000 | 51,384 | 1.00x | 19.67 µs | 22.33 µs | 27.83 µs |
+| 2 | 16,000 | 85,542 | 1.66x | 22.62 µs | 30.96 µs | 37.54 µs |
+| 4 | 8,000 | 90,554 | 1.76x | 46.12 µs | 51.50 µs | 57.21 µs |
+| 8 | 4,000 | 123,614 | 2.41x | 64.00 µs | 77.42 µs | 88.75 µs |
+| 16 | 2,000 | 126,149 | 2.46x | 126.46 µs | 140.04 µs | 146.54 µs |
+
+**GET** (all hits) — takes the lock.
+
+| clients | per client | req/sec | scaling | p50 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32,000 | 48,228 | 1.00x | 20.17 µs | 23.67 µs | 30.33 µs |
+| 2 | 16,000 | 85,435 | 1.77x | 22.92 µs | 31.58 µs | 37.33 µs |
+| 4 | 8,000 | 90,826 | 1.88x | 45.50 µs | 51.62 µs | 57.79 µs |
+| 8 | 4,000 | 121,930 | 2.53x | 65.00 µs | 76.92 µs | 83.88 µs |
+| 16 | 2,000 | 122,507 | 2.54x | 128.96 µs | 149.21 µs | 165.62 µs |
+
+**SET** — takes the lock. Distinct key space per client, so this measures
+contention rather than clients overwriting each other.
+
+| clients | per client | req/sec | scaling | p50 | p95 | p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 32,000 | 46,638 | 1.00x | 20.12 µs | 24.75 µs | 30.62 µs |
+| 2 | 16,000 | 84,821 | 1.82x | 22.67 µs | 31.79 µs | 38.04 µs |
+| 4 | 8,000 | 91,909 | 1.97x | 44.79 µs | 52.12 µs | 58.88 µs |
+| 8 | 4,000 | 119,416 | 2.56x | 64.96 µs | 79.96 µs | 90.12 µs |
+| 16 | 2,000 | 124,034 | 2.66x | 127.71 µs | 141.25 µs | 148.83 µs |
+
+Zero errors in every configuration.
+
+### ⭐ The mutex is not the bottleneck here — and here is the proof
+
+The tempting conclusion from "2.5x at 16 clients" is *the global mutex is
+serialising everything*. **That is wrong, and the PING control is why.**
+
+`PING` takes no lock at all and touches no cache data, yet it plateaus at 2.46x —
+within noise of GET's 2.54x and SET's 2.66x. If the cache mutex were the limit,
+the lock-free path would have kept scaling. It did not.
+
+This follows from Stage 5's measurement that a round trip is ~20 µs while the
+cache operation is ~0.4 µs. A 2% serial section cannot cap speedup at 2.5x;
+Amdahl's law would allow ~50x. The ceiling is the transport, the syscalls, and a
+scheduler running ~32 threads (16 clients + 16 workers) on 12 hardware threads.
+
+### But remove the network, and the mutex has nowhere to hide
+
+N threads calling `SyncCache::get()` directly, no sockets:
+
+| threads | ops/sec | scaling | ns/op |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,391,985 | 1.00x | 227.7 |
+| 2 | 3,655,803 | 0.83x | 273.5 |
+| 4 | 2,122,690 | 0.48x | 471.1 |
+| 8 | 2,691,356 | 0.61x | 371.6 |
+| 16 | 3,065,257 | 0.70x | 326.2 |
+
+**Adding threads makes it slower.** Throughput never reaches the single-threaded
+figure, because the lock admits exactly one thread at a time and the extra threads
+contribute only contention and handoff cost. That is what a hard sequential
+section looks like, and it is the real argument for sharding: not that the lock is
+slow today, but that it is a wall waiting to be hit.
+
+### The third signature: saturation
+
+Across all three TCP tables, **p50 latency rises roughly in proportion to client
+count (20 µs → 128 µs, ~6.4x for 16x the clients) while throughput stays flat**.
+Growing queue, constant service rate — the textbook signature of a saturated
+resource. Clients experience saturation as latency, not as errors, which is why
+there are zero errors in every row.
+
+### What to do with these numbers
+
+They are the honest answer to "how far does thread-per-connection plus one mutex
+get you": **~120k req/sec and ~2.5x scaling on this machine**, limited by the
+transport rather than by the cache. Any future claim of improvement has to beat
+those figures on the same machine in the same sitting.
+
+Two things would move them, and the data says which to do first:
+
+1. **A better I/O model** (an event loop instead of a thread per connection) attacks the measured bottleneck.
+2. **Sharding the cache** attacks the bottleneck that the in-process table shows is waiting behind it.
+
+Doing 2 before 1 would be optimising the part that is not currently limiting
+anything — which is exactly the mistake this benchmark was built to prevent.
 
 ---
 

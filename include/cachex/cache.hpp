@@ -42,7 +42,11 @@ struct TtlInfo {
 /// search. Together they give O(1) lookup *and* O(1) recency updates *and* O(1)
 /// access to the eviction candidate -- which is what makes LRU O(1).
 ///
-/// Not thread-safe. Locking arrives in Stage 7.
+/// **Not thread-safe.** This class is deliberately single-threaded: it pays for
+/// no locking and the in-process benchmarks measure the data structure rather
+/// than a mutex. Wrap it in SyncCache to share it between threads -- and note
+/// that get() mutates (it reorders the recency list), so concurrent "reads"
+/// need exclusive access just as writes do. See sync_cache.hpp.
 class Cache {
  public:
   /// Unbounded: nothing is ever evicted and memory grows with the key count.
