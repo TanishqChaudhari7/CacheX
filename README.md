@@ -14,26 +14,60 @@ it, and the full roadmap.
 
 ## Status
 
-**Stage 4 of 11 — TTL (lazy expiration).**
+**Stage 5 of 11 — TCP server and wire protocol.**
 
-Keys can carry a time-to-live and read as missing once it passes. Expiration is
-**lazy**: expired entries are reclaimed when an operation encounters them, with no
-background thread (see [why](ARCHITECTURE.md#65-why-there-is-no-background-cleanup-thread-yet)).
-Deadlines use a monotonic clock, so a wall-clock change cannot resurrect or
-mass-expire keys. 101 tests pass, including under
+The cache is now reachable over the network. A single-threaded TCP server speaks a
+line-based text protocol ([specification](docs/PROTOCOL.md)), and `cachex_client`
+is an interactive CLI for it. 158 tests pass — parser and framing unit tests plus
+integration tests that drive a real server over a real socket — including under
 AddressSanitizer/UndefinedBehaviorSanitizer and with zero leaks.
 
-There is still **no networking and no concurrency** — the cache is single-threaded
-by design at this stage.
+**The server handles one client at a time.** That is deliberate: the cache is not
+thread-safe, so serving two clients in parallel today would be a data race.
+Concurrency is the next stage, and the network benchmark exists now so the
+before/after can be measured.
 
 | | |
 | --- | --- |
 | ✅ Stage 1 | CMake build, Debug/Release, strict warnings, test framework |
 | ✅ Stage 2 | Core cache (`unordered_map` + `std::list`), benchmark baseline |
 | ✅ Stage 3 | Fixed capacity, O(1) LRU eviction, workload benchmarks |
-| ✅ Stage 4 | Per-key TTL, lazy expiration, 101 tests, measured TTL cost |
-| ⬜ Next | Stage 5 — benchmark harness II (sub-tick latency) |
-| ⬜ Later | TCP server · protocol · concurrency · sharding · persistence · optimisation |
+| ✅ Stage 4 | Per-key TTL, lazy expiration, measured TTL cost |
+| ✅ Stage 5 | TCP server, line protocol, CLI client, 158 tests, network benchmark |
+| ⬜ Next | Stage 6 — benchmark harness II (sub-tick latency) |
+| ⬜ Later | concurrency · sharding · active expiry · persistence · optimisation |
+
+## Try it
+
+```console
+$ ./build/release/bin/cachex_server 6379 &
+CacheX 0.1.0 listening on 127.0.0.1:6379
+
+$ ./build/release/bin/cachex_client localhost 6379
+cachex> SET foo bar
++OK
+cachex> GET foo
+=bar
+cachex> SET session abc 60
++OK
+cachex> TTL session
+:60
+cachex> DELETE foo
+:1
+cachex> GET foo
+_
+cachex> QUIT
++BYE
+```
+
+It also speaks plain `netcat`, which is the point of a text protocol:
+
+```console
+$ printf 'SET foo bar\nGET foo\nQUIT\n' | nc 127.0.0.1 6379
++OK
+=bar
++BYE
+```
 
 ## API
 
@@ -112,6 +146,31 @@ resurrect an expired key or mass-expire the whole cache.
 
 ---
 
+## Wire protocol
+
+One command per line, one reply per line, terminated by `\n` (`\r\n` accepted).
+Every reply starts with a one-byte type tag so a client can dispatch on a single
+character.
+
+| Request | Reply |
+| --- | --- |
+| `SET key value [ttl_seconds]` | `+OK` |
+| `GET key` | `=value` or `_` (nil) |
+| `DELETE key` (alias `DEL`) | `:1` or `:0` |
+| `EXISTS key` | `:1` or `:0` |
+| `TTL key` | `:seconds`, `+NOEXPIRE`, or `_` |
+| `PING` | `+PONG` |
+| `QUIT` | `+BYE`, then the connection closes |
+| anything invalid | `-ERR <reason>` — **connection stays open** |
+
+> ⚠️ **Keys and values cannot contain whitespace or newlines**, because tokens are
+> whitespace-delimited. The cache engine underneath stores arbitrary bytes; this
+> is a limitation of the v1 *protocol*, and it is the clearest argument for
+> length-prefixed framing (which is what RESP does).
+
+Full specification, including limits, error cases, and the connection lifecycle:
+**[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
+
 ## Requirements
 
 - A C++17 compiler — Apple Clang, GCC 9+, or MSVC 2019+
@@ -146,6 +205,21 @@ cmake --build build/release -j
 | `CACHEX_WARNINGS_AS_ERRORS` | `OFF` | Turn warnings into errors — recommended while developing and in CI |
 
 ## Run
+
+Three executables:
+
+| Binary | What it is |
+| --- | --- |
+| `cachex_server [port] [capacity]` | The TCP server. Port defaults to 6379, capacity 0 means unbounded. |
+| `cachex_client [host] [port]` | Interactive CLI client. |
+| `cachex` | In-process demo of the cache API — no networking, useful for seeing LRU and TTL directly. |
+
+```bash
+./build/release/bin/cachex_server 6379 1000   # bounded to 1000 entries
+./build/release/bin/cachex_client localhost 6379
+```
+
+The demo binary:
 
 ```bash
 ./build/debug/bin/cachex
@@ -184,13 +258,21 @@ Or run the binary directly for per-test results:
 [ RUN      ] new_cache_is_empty
 [       OK ] new_cache_is_empty
 ...
-101 / 101 tests passed
+158 / 158 tests passed
 ```
 
-The suite takes ~3 s, almost all of it the TTL tests sleeping. They use real
-time rather than an injectable clock; the tolerances are chosen so that only an
-order-of-magnitude stall could produce a flake, and 20 consecutive runs produced
-none.
+The suite covers four layers:
+
+| Tests | What they cover |
+| --- | --- |
+| `cache_test`, `lru_test`, `ttl_test`, `recency_list_test` | The engine — semantics, eviction, expiry, iterator stability |
+| `line_buffer_test` | Framing: a command split across reads, several commands in one read, CRLF |
+| `protocol_test` | Parsing and reply formatting, plus a whole request/response cycle **with no socket involved** |
+| `server_test` | Integration — a real `Server` on a real socket on an OS-assigned port |
+
+The suite takes ~3 s, almost all of it the TTL tests sleeping. Timing tolerances
+are chosen so only an order-of-magnitude stall could produce a flake; 20
+consecutive runs produced none.
 
 ### Under sanitizers
 
@@ -266,8 +348,33 @@ being requested. Random eviction would track capacity roughly linearly.
 > These numbers are also not comparable to Redis, which pays network and protocol
 > costs this in-process benchmark does not.
 
+### Network benchmark
+
+```bash
+./build/release/bin/cachex_net_bench
+```
+
+Runs a server in-process over loopback and drives it with one blocking client,
+one request in flight at a time — the baseline that "multiple clients" and
+"concurrent server" get compared against later.
+
+| phase | req/sec | avg | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PING | ~50,100 | 19.95 µs | 19.75 µs | 24.79 µs | 30.83 µs |
+| SET | ~47,500 | 21.06 µs | 20.29 µs | 26.25 µs | 32.50 µs |
+| GET | ~48,450 | 20.64 µs | 20.17 µs | 25.46 µs | 31.58 µs |
+
+**`PING` ≈ `SET` ≈ `GET`.** `PING` touches no cache data at all, so the ~0.5 µs
+gap is the entire cost of the cache operation — against a ~20 µs round trip. The
+transport is **97–98% of a request**. Every nanosecond won in Stages 2–4 is
+invisible from the far side of a socket, which is exactly why the next stages are
+about concurrency rather than micro-optimisation.
+
+Unlike the in-process benchmark, these percentiles are *real measurements*: a
+round trip is three orders of magnitude above the 41 ns clock tick.
+
 Methodology — and what is deliberately *not* measured yet — is in
-[ARCHITECTURE.md §9](ARCHITECTURE.md#9-benchmark-methodology).
+[ARCHITECTURE.md §10](ARCHITECTURE.md#10-benchmark-methodology).
 
 ## Project layout
 
@@ -279,28 +386,47 @@ CacheX/
 ├── include/cachex/
 │   ├── cache.hpp               public Cache API
 │   ├── recency_list.hpp        Entry + RecencyList (the MRU→LRU ordering)
+│   ├── line_buffer.hpp         byte stream → lines (no sockets)
+│   ├── protocol.hpp            Command, parser, reply formatting
+│   ├── command_handler.hpp     execute(Cache&, Command) — the bridge
+│   ├── socket.hpp              RAII fd owner, send_all
+│   ├── connection.hpp          one client's read/dispatch/write loop
+│   ├── server.hpp              listening socket and accept loop
 │   └── version.hpp.in          template → generated into the build tree
 ├── src/
-│   ├── cache.cpp               hash map + list, kept in sync; eviction
+│   ├── cache.cpp               hash map + list, eviction, expiry
 │   ├── recency_list.cpp        std::list wrapper; splice-based reordering
-│   ├── version.cpp
-│   └── main.cpp                thin demo; becomes the server in Stage 6
+│   ├── net/                    the network layer (cachex_net)
+│   ├── main.cpp                in-process demo
+│   ├── server_main.cpp         cachex_server
+│   └── client_main.cpp         cachex_client
 ├── tests/
 │   ├── test_framework.hpp      ~100 lines, no dependencies
 │   ├── cache_test.cpp          cache semantics and edge cases
 │   ├── lru_test.cpp            capacity, eviction, recency ordering
 │   ├── ttl_test.cpp            expiry, TTL query, lazy reclamation
 │   ├── recency_list_test.cpp   ordering and iterator stability
-│   └── version_test.cpp
+│   ├── line_buffer_test.cpp    framing: split reads, batched reads, CRLF
+│   ├── protocol_test.cpp       parser + replies, no sockets
+│   └── server_test.cpp         integration over a real socket
 ├── benchmarks/
-│   ├── cache_benchmark.cpp
-│   └── RESULTS.md              recorded baseline + hardware caveats
+│   ├── cache_benchmark.cpp     in-process
+│   ├── net_benchmark.cpp       over TCP
+│   ├── bench_util.hpp          shared timing/percentile helpers
+│   └── RESULTS.md              recorded baselines + hardware caveats
 └── docs/
+    └── PROTOCOL.md             the wire protocol specification
 ```
 
-All logic lives in the `cachex_core` library; `main.cpp`, the tests, and the
-benchmark are thin consumers of it. That split is what lets the tests exercise
-exactly the code the server will run, rather than a second copy of it.
+Two libraries, and the split is the architecture:
+
+- **`cachex_core`** — the cache engine. Knows nothing about sockets.
+- **`cachex_net`** — protocol, framing, sockets, server. Links `cachex_core`.
+
+The dependency runs one way, and the build graph enforces it: `cachex_core` does
+not link `cachex_net`, so cache code that reached for a socket would fail to
+link. The payoff is that `execute(Cache&, Command)` makes the server's entire
+request/response behaviour testable without opening a connection.
 
 ## Roadmap
 
@@ -310,12 +436,12 @@ exactly the code the server will run, rather than a second copy of it.
 | 2 | Core cache (`unordered_map` + doubly linked list) | ✅ Done |
 | 3 | LRU eviction | ✅ Done |
 | 4 | TTL / key expiry | ✅ Done |
-| 5 | Benchmark harness II (sub-tick latency) | ⬜ |
-| 6 | TCP server | ⬜ |
-| 7 | Client protocol | ⬜ |
-| 8 | Concurrency | ⬜ |
-| 9 | Sharded cache | ⬜ |
+| 5 | TCP server + wire protocol + CLI client | ✅ Done |
+| 6 | Benchmark harness II (sub-tick latency) | ⬜ |
+| 7 | Concurrency | ⬜ |
+| 8 | Sharded cache | ⬜ |
+| 9 | Active expiry | ⬜ |
 | 10 | Persistence | ⬜ |
 | 11 | Final optimisation and benchmarking | ⬜ |
 
-Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#13-future-roadmap).
+Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#14-future-roadmap).

@@ -11,13 +11,21 @@
 #include <thread>
 #include <vector>
 
+#include "bench_util.hpp"
 #include "cachex/cache.hpp"
 #include "cachex/version.hpp"
 
 namespace {
 
-using Clock = std::chrono::steady_clock;
-using Nanos = std::chrono::nanoseconds;
+// Timing and statistics helpers are shared with the network benchmark.
+using bench::avg_ns;
+using bench::Clock;
+using bench::Latency;
+using bench::median;
+using bench::Nanos;
+using bench::ops_per_sec;
+using bench::print_latency_row;
+using bench::summarize;
 
 // Fixed so two runs of the same binary -- and runs of two different versions of
 // the cache -- execute exactly the same sequence of operations.
@@ -49,95 +57,6 @@ Nanos time_it(F&& f) {
   const auto start = Clock::now();
   f();
   return std::chrono::duration_cast<Nanos>(Clock::now() - start);
-}
-
-/// Median rather than mean: one unlucky run (a scheduler preemption, a
-/// background process) skews a mean badly and a median not at all.
-Nanos median(std::vector<Nanos> samples) {
-  std::sort(samples.begin(), samples.end());
-  return samples[samples.size() / 2];
-}
-
-double ops_per_sec(Nanos duration, std::size_t ops) {
-  const double seconds = std::chrono::duration<double>(duration).count();
-  return seconds > 0.0 ? static_cast<double>(ops) / seconds : 0.0;
-}
-
-double avg_ns(Nanos duration, std::size_t ops) {
-  return ops > 0 ? static_cast<double>(duration.count()) / static_cast<double>(ops)
-                 : 0.0;
-}
-
-struct Latency {
-  double mean = 0.0;
-  double p50 = 0.0;
-  double p95 = 0.0;
-  double p99 = 0.0;
-  double max = 0.0;
-  std::size_t samples = 0;
-};
-
-/// Sorts in place, then indexes. Nearest-rank; with 100k+ samples the choice of
-/// interpolation rule makes no visible difference.
-Latency summarize(std::vector<std::int64_t>& ns) {
-  Latency out;
-  out.samples = ns.size();
-  if (ns.empty()) {
-    return out;
-  }
-  std::sort(ns.begin(), ns.end());
-
-  const auto at = [&ns](double p) {
-    const auto last = static_cast<double>(ns.size() - 1);
-    return static_cast<double>(ns[static_cast<std::size_t>(p * last)]);
-  };
-  double sum = 0.0;
-  for (const std::int64_t v : ns) {
-    sum += static_cast<double>(v);
-  }
-  out.mean = sum / static_cast<double>(ns.size());
-  out.p50 = at(0.50);
-  out.p95 = at(0.95);
-  out.p99 = at(0.99);
-  out.max = static_cast<double>(ns.back());
-  return out;
-}
-
-/// The smallest non-zero interval the clock can report -- its tick. Per-operation
-/// latencies are quantised to a multiple of this, so on hardware where the tick
-/// is comparable to the operation being timed (Apple Silicon ticks at ~41.7 ns),
-/// a "p50 of 42 ns" means "one tick", not a measurement of 42 ns.
-double measure_clock_granularity_ns() {
-  std::int64_t smallest = std::numeric_limits<std::int64_t>::max();
-  for (int i = 0; i < 200000; ++i) {
-    const auto a = Clock::now();
-    const auto b = Clock::now();
-    const std::int64_t delta = std::chrono::duration_cast<Nanos>(b - a).count();
-    if (delta > 0 && delta < smallest) {
-      smallest = delta;
-    }
-  }
-  return smallest == std::numeric_limits<std::int64_t>::max()
-             ? 0.0
-             : static_cast<double>(smallest);
-}
-
-/// The cost of one steady_clock::now() call, measured rather than assumed.
-/// Every per-operation latency below includes roughly this much overhead, so it
-/// has to be reported next to the percentiles for them to mean anything.
-double measure_clock_overhead_ns() {
-  constexpr int kCalibrationReads = 500000;
-  // volatile, rather than feeding g_sink: the accumulator has to be observable
-  // so the loop survives -O3, but its value is timing-dependent and would make
-  // the reported checksum differ between runs -- destroying the one signal that
-  // proves the measured workload is deterministic.
-  volatile std::int64_t acc = 0;
-  const auto start = Clock::now();
-  for (int i = 0; i < kCalibrationReads; ++i) {
-    acc = acc + Clock::now().time_since_epoch().count();
-  }
-  const auto elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
-  return static_cast<double>(elapsed.count()) / kCalibrationReads;
 }
 
 // --- section 1: core operation microbenchmarks -----------------------------
@@ -408,13 +327,6 @@ void print_phase_row(const char* label, Nanos duration, std::size_t ops) {
             << "\n";
 }
 
-void print_latency_row(const char* label, const Latency& l) {
-  std::cout << std::left << std::setw(14) << label << std::right << std::setw(11)
-            << l.samples << std::fixed << std::setprecision(1) << std::setw(11)
-            << l.mean << std::setw(10) << l.p50 << std::setw(10) << l.p95
-            << std::setw(10) << l.p99 << std::setw(12) << l.max << "\n";
-}
-
 void print_workload_summary(const Outcome& o) {
   const std::size_t gets = o.hits + o.misses;
   const double hit_rate =
@@ -459,8 +371,8 @@ int main() {
             << "*** build. These numbers measure the absence of the optimiser.\n";
 #endif
 
-  const double clock_ns = measure_clock_overhead_ns();
-  const double tick_ns = measure_clock_granularity_ns();
+  const double clock_ns = bench::measure_clock_overhead_ns();
+  const double tick_ns = bench::measure_clock_granularity_ns();
 
   std::cout << "\nbuild          : " << CACHEX_BUILD_TYPE << "\n"
             << "compiler       : " << CACHEX_COMPILER << "\n"

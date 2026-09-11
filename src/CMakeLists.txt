@@ -6,9 +6,10 @@ configure_file(
   "${PROJECT_BINARY_DIR}/generated/cachex/version.hpp"
   @ONLY)
 
-# The real code lives in a library; the executable is a thin main() on top.
-# This is what lets the tests link against the same code the server runs,
-# instead of the tests rebuilding their own copy of it.
+# --- The cache engine -------------------------------------------------------
+#
+# Knows nothing about sockets, and must stay that way. The dependency runs one
+# way only: networking calls the cache.
 add_library(cachex_core
   cache.cpp
   recency_list.cpp
@@ -22,7 +23,30 @@ target_include_directories(cachex_core PUBLIC
 # public interface.
 target_link_libraries(cachex_core PRIVATE cachex_warnings)
 
-add_executable(cachex
-  main.cpp)
+# --- The network layer ------------------------------------------------------
+#
+# A separate target, not just separate files, so the architectural boundary is
+# enforced by the build graph: cachex_core cannot accidentally start depending
+# on socket code, because it does not link this.
+add_library(cachex_net
+  net/line_buffer.cpp
+  net/protocol.cpp
+  net/socket.cpp
+  net/command_handler.cpp
+  net/connection.cpp
+  net/server.cpp)
 
+target_link_libraries(cachex_net PUBLIC cachex_core)
+target_link_libraries(cachex_net PRIVATE cachex_warnings)
+
+# --- Executables ------------------------------------------------------------
+
+# In-process demo of the cache API; no networking involved.
+add_executable(cachex main.cpp)
 target_link_libraries(cachex PRIVATE cachex_core cachex_warnings)
+
+add_executable(cachex_server server_main.cpp)
+target_link_libraries(cachex_server PRIVATE cachex_net cachex_warnings)
+
+add_executable(cachex_client client_main.cpp)
+target_link_libraries(cachex_client PRIVATE cachex_net cachex_warnings)

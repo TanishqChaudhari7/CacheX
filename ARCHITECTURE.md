@@ -1,7 +1,7 @@
 # CacheX — Architecture
 
 > Living document. It is updated at every stage of the project.
-> **Current stage: 4 — TTL (lazy expiration).**
+> **Current stage: 5 — TCP server and wire protocol.**
 
 | Legend | |
 | --- | --- |
@@ -46,8 +46,9 @@ the handful of things that demonstrate the concepts, and nothing more.
 | Expiry | Per-key TTL, lazy expiration | ✅ Stage 4 |
 | Measurement | Benchmark harness: throughput, average latency, percentiles, hit rate | ✅ Stage 3–4 |
 | Active expiry | Background sweep of expired keys | ⬜ after Stage 8 |
-| Networking | Single-node TCP server, line-based text protocol | ⬜ Stages 6–7 |
+| Networking | Single-node TCP server, line-based text protocol | ✅ Stage 5 |
 | Concurrency | Multiple clients served safely and, where possible, in parallel | ⬜ Stage 8 |
+| Length-prefixed framing | Keys/values containing whitespace or binary data | ⬜ future |
 | Sharding | Cache split into independently locked shards | ⬜ Stage 9 |
 | Persistence | Snapshot/restore so state survives a restart | ⬜ Stage 10 |
 
@@ -68,20 +69,28 @@ good interview answer in its own right — *"here is why I did not build it"*.
 ## 3. High-Level Architecture
 
 ```
-                    Client
+             +--------------------+
+             |   cachex_client    |  ✅ interactive CLI           client_main.cpp
+             +--------------------+
                       |
-                      |  ⬜ TCP, line-based text protocol        (Stage 6-7)
+                      |  ✅ TCP, line-based text protocol  (docs/PROTOCOL.md)
                       v
              +--------------------+
-             |   CacheX Server    |  ⬜ accept loop, connections  (Stage 6)
+             |   Server           |  ✅ socket/bind/listen/accept  server.cpp
              +--------------------+
                       |
                       v
              +--------------------+
-             |   Command Parser   |  ⬜ bytes -> typed command    (Stage 7)
+             |   Connection       |  ✅ recv loop, framing         connection.cpp
              +--------------------+
                       |
-======================|====================== everything below is ✅ implemented
+                      v
+             +--------------------+
+             |   Command Parser   |  ✅ bytes -> typed Command     protocol.cpp
+             |   + reply format   |
+             +--------------------+
+                      |
+======================|====== the boundary: nothing below knows about sockets
                       v
         +-------------------------------------------+
         |                  Cache                    |  cache.hpp / cache.cpp
@@ -197,7 +206,7 @@ exactly a hash table: average O(1), independent of how many keys are stored.
 **Its weaknesses, stated honestly** — these are the follow-up questions:
 
 - O(1) is *average*, not worst case. Adversarial keys that all hash to one bucket degrade it to O(n). Real caches on untrusted input mitigate this with a randomly seeded hash; CacheX assumes a trusted network (§2), so it does not.
-- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§9).
+- It is node-based: every element is a separate allocation, and traversal chases pointers. This shows up clearly in the benchmark (§10).
 - Growth rehashes every element, so an individual `set` can be O(n) even though the amortised cost is O(1). A *bounded* cache reaches its final bucket count and then stops rehashing, so in the steady state this stops happening at all — one of the quieter benefits of adding capacity.
 
 ### 4.4 Why a doubly linked list
@@ -395,7 +404,7 @@ comparison. One `time_point` answers "is this expired?" with a single `<=`.
 state from any deadline, not a magic value of one. It also buys the performance
 property that matters most: `has_value()` is checked *first*, so an entry without
 a TTL never reads the clock at all. That short-circuit is why TTL is nearly free
-for keys that do not use it — and §9 measures exactly how much it costs for keys
+for keys that do not use it — and §10 measures exactly how much it costs for keys
 that do.
 
 `ttl()` returns a small tagged type rather than an integer:
@@ -578,11 +587,271 @@ implements the idea, not the product. The differences worth knowing:
 The gap that matters most is **active expiry**. Everything in §6.4 is a
 consequence of not having it, and Redis has it precisely because those problems
 are real at production scale.
+---
+
+## 7. Client/Server Architecture
+
+### 7.1 Why TCP, and what "protocol" means twice over
+
+**TCP over UDP.** A cache client needs to know that its `SET` arrived, arrived
+once, and arrived intact — and a `GET` reply larger than a packet has to be
+reassembled in order. TCP provides exactly that: reliable, ordered, de-duplicated
+delivery with retransmission and flow control. Over UDP every one of those would
+have to be rebuilt by hand, and the result would be a worse TCP. Redis, memcached
+and every mainstream database use TCP for the same reason.
+
+UDP is the right choice when *late data is worthless* — live audio, video,
+telemetry — where retransmitting a packet that is already too old to use only
+makes things worse. A cache is the opposite: a slightly late answer is still the
+right answer. (memcached does offer a UDP mode, for `get`-only traffic where a
+lost reply can simply be re-fetched. CacheX does not.)
+
+**Two different protocols, stacked.** This distinction is worth being precise
+about:
+
+| | Transport protocol (TCP) | Application protocol (CacheX v1) |
+| --- | --- | --- |
+| Provided by | The operating system's network stack | This codebase, in `protocol.cpp` |
+| Guarantees | Bytes arrive, in order, without duplication or corruption | What those bytes *mean* |
+| Unit | A byte stream — **no message boundaries at all** | One command per line |
+| Knows about | Ports, sequence numbers, windows, retransmission | `SET`, `GET`, `+OK`, `-ERR` |
+
+TCP will faithfully deliver every byte of `SET foo bar` and has no idea that
+those bytes form a command. **The application protocol's whole job is to put
+boundaries back.** That is why §7.4 exists, and why `recv()` returning half a
+command is normal rather than a bug.
+
+### 7.2 Component layout
+
+```
+                         Client process
+   +------------------------------------------------+
+   |  cachex_client  --  REPL, LineBuffer, Socket    |
+   +------------------------------------------------+
+                          |
+                          |  TCP, loopback or LAN
+                          v
+   ==================== Server process ==============================
+   +------------------------------------------------+
+   |  Server            socket/bind/listen/accept    |  server.cpp
+   +------------------------------------------------+
+                          | one accepted Socket
+                          v
+   +------------------------------------------------+
+   |  Connection        recv loop, framing, replies  |  connection.cpp
+   +------------------------------------------------+
+              |                               ^
+              | line                          | reply string
+              v                               |
+   +----------------------+       +--------------------------+
+   |  parse_command()     |       |  reply_ok / reply_value  |  protocol.cpp
+   |  bytes -> Command    |       |  reply_nil / reply_error |
+   +----------------------+       +--------------------------+
+              |                               ^
+              +-------------> execute() ------+                command_handler.cpp
+                                  |
+                                  v
+   ------------------------------------------------- the boundary
+   +------------------------------------------------+
+   |  Cache        set · get · erase · contains      |  cache.cpp
+   |               ttl · size · capacity             |
+   +------------------------------------------------+
+                    |                  |
+              RecencyList          unordered_map
+```
+
+**The cache does not know that sockets exist**, and that is enforced by the build
+graph, not just by discipline: `cachex_core` (cache, recency list) does not link
+`cachex_net` (protocol, sockets, server). The dependency runs one way —
+networking calls the cache. Anything in `cache.cpp` that reached for a socket
+would fail to link.
+
+The payoff is testability. `execute(Cache&, Command)` takes a parsed command and
+returns a reply string, so the complete request/response behaviour of the server
+can be tested without opening a connection
+(`protocol_test.cpp: execute_runs_a_whole_request_response_cycle_without_a_socket`).
+The integration tests then only have to prove that the *plumbing* works, not the
+semantics.
+
+| Component | File | Knows about |
+| --- | --- | --- |
+| `LineBuffer` | `net/line_buffer.cpp` | Bytes and newlines. No sockets, no commands. |
+| `parse_command` / `reply_*` | `net/protocol.cpp` | The grammar. No sockets, no cache. |
+| `execute` | `net/command_handler.cpp` | Commands and the cache. **No sockets.** |
+| `Socket` | `net/socket.cpp` | File descriptors and their lifetime. |
+| `Connection` | `net/connection.cpp` | One client: recv, framing, dispatch, send. |
+| `Server` | `net/server.cpp` | The listening socket and the accept loop. |
+
+### 7.3 The TCP request lifecycle
+
+What the four socket calls actually do — they are routinely confused:
+
+```
+  SERVER                                          CLIENT
+
+  socket()   create an endpoint. Just a file
+             descriptor; no address yet.
+      |
+  bind()     claim 127.0.0.1:6379. Now the
+             address is ours.
+      |
+  listen()   mark the socket PASSIVE. Does not
+             block and accepts nothing. It tells
+             the kernel: complete TCP handshakes
+             on my behalf and queue the finished
+             connections, up to `backlog` deep.
+      |
+      |                                      socket()
+      |                                          |
+      |   <====== SYN ========================  connect()  blocks until the
+      |   ======= SYN-ACK =================>     |         handshake completes
+      |   <====== ACK ========================   |
+      |                                          |
+      |   The kernel completed that handshake    |
+      |   by itself and put the connection on    |
+      |   the accept queue. The application      |
+      |   has not run any code yet.              |
+      |                                          |
+  accept()   take one finished connection off
+             the queue. Returns a NEW socket for
+             that client; the listening socket
+             stays open and keeps accepting.
+             Two sockets, two jobs.
+      |                                          |
+      |   <====== "GET foo\n" ================  send()
+  recv()     returns whatever bytes have arrived
+      |
+      |   parse -> execute -> format
+      |
+  send()  ===== "=bar\n" ==================>   recv()
+      |                                          |
+      |   ... repeat for the life of the connection ...
+      |
+      |   <====== FIN ========================  close()
+  recv()     returns 0 = end of stream
+  close()
+```
+
+Three things this makes concrete:
+
+- **`listen()` does not accept and does not block.** It is a one-time state change on the socket. Every subsequent handshake is completed by the kernel whether or not the application ever calls `accept()`.
+- **A client's `connect()` can succeed while the server is busy.** The handshake is the kernel's work; the connection then waits in the backlog. So "connected" does not mean "being served".
+- **`accept()` returns a different socket.** The listening socket is never read from or written to; it exists only to produce new sockets.
+
+### 7.4 Framing, and why `recv()` returns partial data
+
+`recv()` returns *whatever bytes have arrived so far*, which may be:
+
+- **less than one command** — the client's `send()` was split across packets, or the data crossed an MTU boundary, or the sender's TCP buffer flushed early;
+- **exactly one command** — the common case, and the one that lets buggy servers pass casual testing;
+- **several commands at once** — the client pipelined, or Nagle coalesced them;
+- **two and a half commands** — the general case, and the one you must actually write code for.
+
+None of these is an error. TCP promises a byte *stream*; it never promised to
+preserve the boundaries between writes. A server that assumes "one `recv()` =
+one request" works perfectly on loopback with a slow hand-typed client and
+corrupts itself the moment a real client pipelines.
+
+`LineBuffer` is the answer, and it is deliberately socket-free so that every
+awkward split can be reproduced in a unit test by choosing where to cut the
+input:
+
+```cpp
+while (true) {
+  // Drain every complete line already buffered BEFORE asking for more bytes.
+  // A client that pipelines would hang forever if we served one request per read.
+  while (const auto line = buffer_.next_line()) {
+    if (!handle_line(*line)) return;
+  }
+  if (buffer_.buffered() > kMaxLineBytes) { /* refuse and close */ }
+  if (!fill_buffer()) return;   // recv() == 0 means the peer is gone
+}
+```
+
+The mirror problem exists on the way out. **`send()` may accept fewer bytes than
+offered** — the kernel's send buffer can simply be full — so `send_all()` loops
+until the whole reply is gone. Ignoring `send()`'s return value is one of the
+classic socket bugs: the reply goes out truncated and the peer's stream is
+corrupted from then on.
+
+### 7.5 Parser design
+
+```cpp
+struct ParseResult { bool ok; Command command; std::string error; };
+ParseResult parse_command(std::string_view line);
+```
+
+- **`string_view` in, no allocation while scanning.** Tokens are views into the caller's line; only the accepted `Command` copies anything.
+- **A result type, not exceptions.** A malformed command is an ordinary, expected event on a public socket — clients send garbage constantly. That is not an exceptional condition, and making it one would put a throw/catch on the hot path of a server's most common failure mode.
+- **`std::from_chars`, not `atoi`/`stoll`.** No exceptions, no locale, and — critically — it reports where parsing stopped, so `12abc` is *rejected* rather than silently read as `12`. `atoi` would accept it.
+- **The parser never sees a `\n`.** Framing already removed it. One job each.
+- **Verbs are case-insensitive; keys and values are not.** Typing `get foo` by hand should work; `Key` and `key` are different keys.
+
+### 7.6 Error handling
+
+The rule: **a bad command is a reply, not a disconnection.**
+
+| Situation | Response | Connection |
+| --- | --- | --- |
+| Unknown verb, wrong arity, bad TTL, empty line | `-ERR <reason>` | **stays open** |
+| Request line over 64 KiB | `-ERR line too long...` | **closed** |
+| Client disconnects (`recv` → 0) | — | closed |
+| `send()` fails mid-reply | — | abandoned |
+
+The single exception — the over-long line — is a *framing* failure rather than a
+semantic one: the server no longer knows where the next command begins, so there
+is nothing safe to do but hang up. Redis behaves the same way. Recovering by
+discarding input until the next newline would be possible; closing is simpler and
+this is a protocol violation, not a typo.
+
+Two hazards the server has to survive, both tested:
+
+- **Writing to a peer that has vanished** raises `SIGPIPE`, whose default action is to *kill the process*. A server that dies because a client hung up is unacceptable. Suppressed with `MSG_NOSIGNAL` (Linux) or `SO_NOSIGPIPE` (macOS/BSD).
+- **`EINTR`** — a signal arriving mid-syscall — means "nothing happened, try again", not "failure". Treating it as an error is a classic source of rare, unexplainable dropped connections.
+
+### 7.7 Input limits
+
+| Limit | Value | Why it exists |
+| --- | --- | --- |
+| Request line | 64 KiB | **Without it, a client that never sends `\n` makes the server buffer until it runs out of memory.** One missing check between a working server and a trivial denial of service. |
+| TTL | ≤ 10 years | Guards the deadline arithmetic against overflow. |
+| Echoed tokens in errors | 32 chars | So a 60 KB junk token cannot be reflected back in full. |
+| Accept backlog | 128 | Bounds the kernel's queue of waiting connections. |
+
+The general principle: **every buffer that grows in response to input needs a
+bound**, and the bound belongs at the layer that knows the policy. `LineBuffer`
+deliberately does *not* enforce the line limit — it reports `buffered()` and lets
+`Connection` decide, which keeps policy out of the framing code.
+
+### 7.8 Connection lifecycle and concurrency
+
+One connection carries any number of commands; opening a connection per request
+would pay a full three-way handshake each time. It ends in one of three ways:
+`QUIT` (acknowledged with `+BYE` *before* the close, so the client never has to
+guess), client disconnect (`recv` → 0), or a framing violation.
+
+**The Stage 5 server serves exactly one client at a time.** `accept()` returns a
+connection, it is served to completion, and only then is the next one accepted. A
+second client's `connect()` succeeds — the kernel completes the handshake — and
+then it waits in the backlog.
+
+This is a deliberate limitation, not an oversight: **the cache is not
+thread-safe**, so serving two clients in parallel today would be a data race, not
+a feature. ⬜ Concurrency is Stage 8, and the network benchmark exists now
+precisely so that "single client → multiple clients → concurrent server" can be
+compared against a recorded baseline.
+
+The one concession to threads is `Server::stop()`, an `std::atomic<bool>` the
+accept loop polls so a caller on another thread can shut it down. `accept()`
+blocks indefinitely, which would make the server unstoppable, so the loop waits
+on `poll()` with a 100 ms timeout and re-checks the flag. Exactly one thread ever
+touches the cache.
+
 
 
 ---
 
-## 7. Complexity
+## 8. Complexity
 
 All bounds assume a hash function that distributes keys reasonably.
 
@@ -607,20 +876,20 @@ always `entries_.oldest()` — the tail of the list — reachable in constant ti
 and expiry is only ever checked on an entry an operation is already holding.
 
 **Space: O(n)**, bounded by `capacity` once one is set. Per entry, roughly:
-the key twice (§8), the value once, two list pointers, and the map's node and
+the key twice (§9), the value once, two list pointers, and the map's node and
 bucket overhead. For a 16-byte key and a 64-byte value that is an estimated
 ~180–200 bytes for ~80 bytes of payload. ⬜ *That figure is an estimate from the
 data layout, not a measurement; measuring it properly is Stage 11 work.*
 
 A caveat that matters more than the table: **every operation here is O(1), and
-they still differ by roughly 10× in measured cost** (§9). The constant factors —
+they still differ by roughly 10× in measured cost** (§10). The constant factors —
 allocation, copying, and memory locality — dominate at this scale. The table is
 the right answer to "how does this scale?" and the wrong answer to "which is
 fastest?".
 
 ---
 
-## 8. Ownership and Lifetime
+## 9. Ownership and Lifetime
 
 This is where a cache of this shape goes wrong, so it is worth being precise.
 
@@ -708,7 +977,7 @@ tests pin this (`get_missing_key_returns_nullopt`,
 
 ---
 
-## 9. Benchmark Methodology
+## 10. Benchmark Methodology
 
 Source: `benchmarks/cache_benchmark.cpp`. Results: `benchmarks/RESULTS.md`.
 
@@ -728,6 +997,25 @@ cmake --build build/release -j
 | 4 | Workload B | 20% GET / 80% SET, uniform keys, eviction-dominated |
 | 5 | Hit rate vs capacity | The point of LRU, as a curve |
 | 6 | Cost of TTL checks | GET hits with no TTL, with a TTL, and over expired entries |
+
+A second binary, `cachex_net_bench`, measures the same cache **over TCP**:
+
+| Phase | Purpose |
+| --- | --- |
+| `PING` | The transport floor — a full round trip that touches no cache data |
+| `SET` | Round trip including a cache write |
+| `GET` | Round trip including a cache read |
+
+Its methodology, and how it differs:
+
+| Decision | Reason |
+| --- | --- |
+| Server runs in-process, on a thread, over loopback | One self-contained binary, and no doubt about which build of the server is being measured. The cost is that no real network is involved — loopback skips the NIC, the wire, and most of the IP stack. |
+| One client, one request in flight | No pipelining and no concurrency, so every request is a full round trip. This is the baseline that "multiple clients" and "concurrent server" get compared against later. |
+| `TCP_NODELAY` on both ends | Without it, Nagle's algorithm plus delayed ACKs add up to ~40 ms per round trip and would dominate every number here. |
+| Per-request timing, always | Unlike the in-process benchmark, per-request clock reads are cheap *relative to what is measured*: a round trip is ~20 µs against a 41 ns tick, three orders of magnitude apart. **The percentiles here are real measurements, not tick counts.** |
+| Commands built before timing | String construction is never timed. |
+| 2 000-request warm-up, discarded | The first requests pay for TCP window ramp-up and a cold cache. |
 
 ### Design decisions, and why each one is there
 
@@ -799,18 +1087,30 @@ Headline findings from the Stage 3 run:
 
 ---
 
-## 10. Current Components
+## 11. Current Components
 
 | Path | Purpose | Status |
 | --- | --- | --- |
 | `CMakeLists.txt` | Language standard, build options, warning flags | ✅ |
-| `include/cachex/cache.hpp` | Public `Cache` API, capacity and eviction | ✅ |
+| `include/cachex/cache.hpp` | Public `Cache` API, capacity, eviction, TTL | ✅ |
+| `include/cachex/line_buffer.hpp` | Byte stream → lines. No sockets. | ✅ |
+| `include/cachex/protocol.hpp` | `Command`, parser, reply formatting | ✅ |
+| `include/cachex/socket.hpp` | RAII file-descriptor owner, `send_all` | ✅ |
+| `include/cachex/command_handler.hpp` | `execute(Cache&, Command)` — the bridge | ✅ |
+| `include/cachex/connection.hpp` | One client's read/dispatch/write loop | ✅ |
+| `include/cachex/server.hpp` | Listening socket and accept loop | ✅ |
+| `src/net/` | Implementations of the above | ✅ |
+| `src/server_main.cpp`, `src/client_main.cpp` | `cachex_server`, `cachex_client` | ✅ |
+| `docs/PROTOCOL.md` | The wire protocol specification | ✅ |
 | `include/cachex/recency_list.hpp` | `Entry` and `RecencyList` | ✅ |
 | `src/cache.cpp`, `src/recency_list.cpp` | Implementations | ✅ |
 | `src/main.cpp` | Short in-process demo; ⬜ becomes the server in Stage 6 | ✅ |
 | `tests/cache_test.cpp` | Cache semantics and edge cases | ✅ |
 | `tests/lru_test.cpp` | Capacity, eviction, and recency ordering | ✅ |
 | `tests/ttl_test.cpp` | Expiry, TTL query, and lazy-reclamation behaviour | ✅ |
+| `tests/line_buffer_test.cpp` | Framing: split reads, batched reads, CRLF | ✅ |
+| `tests/protocol_test.cpp` | Parser and reply formatting, no sockets | ✅ |
+| `tests/server_test.cpp` | Integration: a real server over a real socket | ✅ |
 | `tests/recency_list_test.cpp` | Ordering and iterator stability | ✅ |
 | `benchmarks/` | `cachex_bench` + `RESULTS.md`; off by default | ✅ |
 | `docs/` | Longer-form notes | — |
@@ -821,11 +1121,25 @@ Headline findings from the Stage 3 run:
 cachex_warnings  (INTERFACE)  warning flags, carried as a target not global flags
         |
         +--> cachex_core  (static library)  cache · recency_list · version
+                    |                       KNOWS NOTHING ABOUT SOCKETS
+                    |
+                    +--> cachex_net  (static library)
+                    |        line_buffer · protocol · socket
+                    |        command_handler · connection · server
+                    |             |
+                    |             +--> cachex_server     the TCP server
+                    |             +--> cachex_client     interactive CLI
+                    |             +--> cachex_tests      unit + integration
+                    |             +--> cachex_net_bench  network benchmark (opt-in)
                     |
                     +--> cachex        thin main(), in-process demo
-                    +--> cachex_tests  links the same library
-                    +--> cachex_bench  links the same library  (opt-in)
+                    +--> cachex_bench  in-process benchmark (opt-in)
 ```
+
+**The two libraries are the architectural boundary, expressed in the build
+graph.** `cachex_core` does not link `cachex_net`, so cache code cannot start
+depending on socket code by accident — it would fail to link. The dependency runs
+one way: networking calls the cache.
 
 **The library/executable split is the most important structural decision.** A
 `main()` cannot be linked into a test binary — there would be two. If the logic
@@ -836,9 +1150,9 @@ server will run.
 
 ---
 
-## 11. Design Decisions
+## 12. Design Decisions
 
-### 11.1 Why C++17 rather than C++20
+### 12.1 Why C++17 rather than C++20
 
 C++17 already contains everything this project needs, and Stage 3 leans on
 `std::optional` twice — once for a lookup that may miss, once for a capacity that
@@ -853,7 +1167,7 @@ their machine.
 | `std::format` | Convenience only; library support is still uneven. |
 | Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It does not bite yet, but it will when the protocol parser hands over views into a socket buffer (Stage 7). The fix is a transparent hash functor, not a language upgrade. |
 
-### 11.2 Why CMake
+### 12.2 Why CMake
 
 The de-facto standard for C++, so it is what reviewers expect and what IDEs,
 `clangd`, sanitizers, and CI already understand. It makes Debug/Release a
@@ -861,7 +1175,7 @@ configuration flag rather than hand-maintained compiler invocations. The CMake
 here is **target-based**: properties attach to targets rather than directory-wide
 globals, so include paths and flags travel with the target that needs them.
 
-### 11.3 Why warnings are an INTERFACE target
+### 12.3 Why warnings are an INTERFACE target
 
 `cachex_warnings` carries no code, only flags; targets opt in by linking it.
 Appending to global `CMAKE_CXX_FLAGS` would apply them to any third-party library
@@ -871,7 +1185,7 @@ past is how a real warning in our own code gets missed.
 `-Werror` is available (`-DCACHEX_WARNINGS_AS_ERRORS=ON`) but off by default, so a
 new compiler version with a new warning cannot break someone's clone.
 
-### 11.4 Why the test framework is hand-written
+### 12.4 Why the test framework is hand-written
 
 ~100 lines of header, no dependency. Only three capabilities are needed: register
 a test, assert a condition, exit non-zero. GoogleTest or Catch2 would be the
@@ -885,7 +1199,7 @@ a namespace-scope registry could be registered *into* before it was constructed.
 A function-local static is constructed on first use. This is the *static
 initialisation order fiasco*.
 
-### 11.5 Why the tests run under sanitizers
+### 12.5 Why the tests run under sanitizers
 
 The correctness of this design rests on a claim about iterator validity, and
 nothing in the type system enforces it. A dangling `std::list` iterator will
@@ -902,14 +1216,14 @@ cmake --build build/asan -j --target cachex_tests && ./build/asan/bin/cachex_tes
 leaks --atExit -- ./build/debug/bin/cachex_tests
 ```
 
-### 11.6 Why the version header is generated
+### 12.6 Why the version header is generated
 
 `configure_file()` expands `include/cachex/version.hpp.in` into the build
 directory, substituting the version from `project()`. Otherwise the version lives
 in two places and drifts. The generated header goes in the build tree, never the
 source tree.
 
-### 11.7 Why `build/` is not committed
+### 12.7 Why `build/` is not committed
 
 Build output is reproducible from the sources, specific to one compiler and one
 machine, goes stale the instant a flag changes, and makes every diff unreadable.
@@ -917,7 +1231,7 @@ Commit the inputs, never the outputs.
 
 ---
 
-## 12. Interview Questions I Should Be Able To Answer
+## 13. Interview Questions I Should Be Able To Answer
 
 ### Why not use only a hash map?
 
@@ -1065,7 +1379,7 @@ it rejects `SET ... EX 0` as an error, and uses `EXPIRE key 0` for the delete.
 ~12% of a GET hit, measured — about 12 ns, which is one `steady_clock::now()`
 read. Keys *without* a TTL pay none of it, because the `optional` is tested
 before the clock is read. That short-circuit is the whole reason TTL is close to
-free for keys that do not use it. §9.
+free for keys that do not use it. §10.
 
 ### How would you test something that depends on time without flaky tests?
 
@@ -1080,6 +1394,98 @@ deterministic. It is not used here because it puts indirection in the hottest
 path in the cache to serve the tests — worth revisiting if the ~1.7 s of sleeping
 becomes annoying, but not worth it yet.
 
+### TCP or UDP for a cache, and why?
+
+TCP. A client needs to know its `SET` arrived, arrived once, and arrived intact,
+and a reply larger than one packet must be reassembled in order. TCP gives all of
+that — reliability, ordering, de-duplication, retransmission, flow control. Over
+UDP you would rebuild every one of those by hand and end up with a worse TCP.
+
+UDP wins when *late data is worthless*: live audio, video, telemetry, where
+re-sending a packet that is already too old only makes things worse. A cache is
+the opposite — a slightly late answer is still the right answer. (memcached does
+offer a UDP mode for `get`-only traffic, where a lost reply can just be
+re-fetched.)
+
+### What is the difference between `listen()` and `accept()`?
+
+`listen()` is a one-time state change: it marks the socket *passive* and tells
+the kernel to complete TCP handshakes on your behalf and queue the finished
+connections, up to `backlog` deep. It does not block and it accepts nothing.
+
+`accept()` takes one already-completed connection off that queue and returns **a
+new socket** for it. The listening socket stays open and is never read from or
+written to — its only job is producing new sockets.
+
+The consequence people miss: a client's `connect()` can succeed while the server
+is busy and has not called `accept()` at all, because the kernel did the
+handshake. "Connected" does not mean "being served".
+
+### What happens during `connect()`?
+
+The client's kernel sends SYN, the server's kernel replies SYN-ACK, the client
+ACKs. The server *application* runs no code during any of this — its kernel
+completes the handshake and puts the connection on the accept queue. `connect()`
+returns once the handshake is done; if the backlog is full, it may block or be
+refused.
+
+### Why can `recv()` return partial data?
+
+Because TCP is a byte **stream**, not a message queue. It guarantees the bytes
+arrive in order; it never promised to preserve the boundaries between the sender's
+writes. One `recv()` can return half a command, exactly one, three, or two and a
+half — depending on packet sizes, MTU, Nagle, and how the sender's buffer
+flushed. None of those is an error.
+
+A server that assumes "one `recv()` = one request" passes casual testing against
+a hand-typed client and corrupts itself the moment a real client pipelines.
+
+The same applies on the way out: **`send()` may accept fewer bytes than offered**,
+so it has to loop too. Ignoring `send()`'s return value truncates replies and
+corrupts the peer's stream.
+
+### Why is protocol framing necessary?
+
+Because the transport deliberately does not provide it. TCP delivers
+`SET foo bar` faithfully and has no idea those bytes form a command. Framing is
+the application protocol's entire job: putting the boundaries back.
+
+CacheX frames with a newline. RESP frames with a length prefix (`$3\r\nfoo\r\n`),
+which is strictly better: the length comes first, so the payload needs no escaping
+and can contain any byte — including spaces and newlines. That is exactly the
+limitation CacheX v1 has, and it is documented rather than hidden
+(`docs/PROTOCOL.md` §3).
+
+### What happens when a client disconnects?
+
+`recv()` returns **0**. That is end-of-stream — not an error, and not "no data
+yet" (which would be `-1` with `EAGAIN` on a non-blocking socket). The server
+closes its side and returns to `accept()`.
+
+An *abrupt* disconnect is nastier: the server may be mid-`send()` to a socket the
+peer has already abandoned. That raises `SIGPIPE`, whose default action is to
+**kill the process** — a server dying because a client hung up. It is suppressed
+with `MSG_NOSIGNAL` (Linux) or `SO_NOSIGPIPE` (macOS/BSD), and the failed `send()`
+is then just an error code. There is a test that hangs up on the server
+mid-reply five times and then checks the server still answers.
+
+### Why does the server need `SO_REUSEADDR`?
+
+When a server exits, its closed connections sit in `TIME_WAIT` for up to a couple
+of minutes, so that late duplicate packets cannot be delivered to a new
+connection reusing the same port pair. Without `SO_REUSEADDR`, restarting the
+server fails with "Address already in use" for that whole window.
+
+### Why is the cache kept ignorant of sockets?
+
+So that the request/response behaviour can be tested without a socket, and so the
+transport can be replaced without touching the engine. `execute(Cache&, Command)`
+takes a parsed command and returns a reply string — the whole server's semantics
+are testable in-process.
+
+It is enforced by the build graph, not discipline: `cachex_core` does not link
+`cachex_net`, so cache code that reached for a socket would fail to link.
+
 ### How would you test that eviction is correct?
 
 Not by checking `size()` — that passes even if the *wrong* entry is evicted. The
@@ -1090,7 +1496,7 @@ test that verifies the map and the list still agree on which keys exist.
 
 ---
 
-## 13. Future Roadmap
+## 14. Future Roadmap
 
 **Everything below is ⬜ future work.**
 
@@ -1098,16 +1504,20 @@ test that verifies the map and the list still agree on which keys exist.
 | --- | --- | --- | --- | --- |
 | 1 | Project foundation | CMake, structure, warnings, test harness | Build systems, testability | ✅ |
 | 2 | Core cache | `set`/`get`/`erase`/`contains`/`size`, hash map + list | Hash tables, iterator invalidation, ownership | ✅ |
-| 3 | **LRU eviction** | Capacity limit, O(1) eviction, workload benchmarks | Why O(1) LRU needs both structures; hit rate | ✅ |
-| 4 | **TTL** | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
-| 5 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
-| 8+ | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
-| 6 | TCP server | `socket`/`bind`/`listen`/`accept`, one client | The socket API; blocking I/O; partial reads | ⬜ |
-| 7 | Client protocol | Line-based text protocol and parser | Framing, buffering, malformed input | ⬜ |
-| 8 | Concurrency | Many clients — thread pool or event loop | Data races, why `shared_mutex` disappoints for LRU | ⬜ |
-| 9 | Sharded cache | N independently locked shards | Lock contention as the real bottleneck | ⬜ |
+| 3 | LRU eviction | Capacity limit, O(1) eviction, workload benchmarks | Why O(1) LRU needs both structures; hit rate | ✅ |
+| 4 | TTL | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
+| 5 | **TCP server + protocol** | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
+| 6 | Benchmark harness II | Sub-tick latency, better measurement environment | Why the average latency lies | ⬜ |
+| 7 | Concurrency | Many clients at once — thread pool or event loop | Data races, why `shared_mutex` disappoints for LRU | ⬜ |
+| 8 | Sharded cache | N independently locked shards | Lock contention as the real bottleneck | ⬜ |
+| 9 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
 | 10 | Persistence | Snapshot to disk, restore on startup | Serialisation; durability vs. throughput | ⬜ |
-| 11 | Final optimisation | Profile, tune, re-benchmark against the Stage 2/3 baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
+| 11 | Final optimisation | Profile, tune, re-benchmark against the recorded baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
 
-Each stage ends with this document updated: components in §10, decisions in §11,
-new questions in §12, and the diagram in §3 grown to match what actually exists.
+Stage numbering note: concurrency and sharding moved up one, and active expiry
+slotted in after them, because active expiry cannot safely precede thread safety
+(§6.5). Earlier documents referred to concurrency as "Stage 8"; the ordering is
+what matters, not the number.
+
+Each stage ends with this document updated: components in §11, decisions in §12,
+new questions in §13, and the diagram in §3 grown to match what actually exists.

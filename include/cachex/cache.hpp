@@ -42,7 +42,7 @@ struct TtlInfo {
 /// search. Together they give O(1) lookup *and* O(1) recency updates *and* O(1)
 /// access to the eviction candidate -- which is what makes LRU O(1).
 ///
-/// Not thread-safe. Locking arrives in Stage 8.
+/// Not thread-safe. Locking arrives in Stage 7.
 class Cache {
  public:
   /// Unbounded: nothing is ever evicted and memory grows with the key count.

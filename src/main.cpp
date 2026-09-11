@@ -23,8 +23,9 @@ void print_order(const cachex::Cache& cache) {
 
 }  // namespace
 
-// There is no server yet, so the executable demonstrates the cache API rather
-// than running a process. Stage 6 replaces this with an accept loop.
+// A demonstration of the cache API on its own, with no networking involved.
+// The TCP server lives in cachex_server; this binary exists so the engine's
+// behaviour (LRU order, expiry) can be seen directly rather than through a socket.
 int main() {
   std::cout << "CacheX " << cachex::version_string()
             << " -- in-process cache demo (no server yet)\n";

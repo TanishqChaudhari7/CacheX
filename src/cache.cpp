@@ -10,7 +10,7 @@ namespace {
 /// The short-circuit matters: an entry with no deadline never reads the clock.
 /// steady_clock::now() costs roughly as much as the hash lookup itself, so
 /// checking `has_value()` first is what keeps TTL close to free for the keys
-/// that do not use it. Benchmarked in ARCHITECTURE.md §9.
+/// that do not use it. Benchmarked in ARCHITECTURE.md §10.
 bool is_expired(const Entry& entry) {
   return entry.expires_at.has_value() && *entry.expires_at <= Entry::Clock::now();
 }

@@ -6,13 +6,94 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §9](../ARCHITECTURE.md#9-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §10](../ARCHITECTURE.md#10-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
 ./build/release/bin/cachex_bench
 ```
+
+---
+
+## Stage 5 — over TCP
+
+| | |
+| --- | --- |
+| Date | 2026-09-11 |
+| Machine | Apple M2 Pro, 12 cores, 16 GB RAM |
+| OS | macOS 26.5.2 (arm64) |
+| Compiler | AppleClang 21.0.0, `-O3 -DNDEBUG`, C++17 |
+| Harness | `cachex_net_bench` — server in-process on a thread, loopback, `TCP_NODELAY` |
+| Client | 1, blocking, one request in flight (no pipelining) |
+
+```
+phase       requests       req/sec    avg (us)        p50        p95        p99    max (us)
+-------------------------------------------------------------------------------------------
+PING           20000         50114       19.95      19.75      24.79      30.83      195.33
+SET            20000         47482       21.06      20.29      26.25      32.50      230.46
+GET            20000         48450       20.64      20.17      25.46      31.58      205.54
+```
+
+Three consecutive runs (req/sec): PING 50114 / 49438 / 50056, SET 47482 / 47495 /
+48033, GET 48450 / 47182 / 47935 — about 3% spread, noticeably steadier than the
+in-process phases, because a round trip is dominated by a fairly uniform
+syscall-and-scheduling path rather than by memory access patterns.
+
+### ⭐ The transport is 97–98% of a request
+
+`PING` touches no cache data at all. It is the floor: pure round trip.
+
+| | p50 | what it includes |
+| --- | ---: | --- |
+| `PING` | 19.75 µs | the transport, and nothing else |
+| `GET` | 20.17 µs | transport **+ a cache read** |
+| `SET` | 20.29 µs | transport **+ a cache write** |
+
+The cache operation is the difference: **~0.4–0.5 µs out of ~20 µs.**
+
+This cross-validates nicely with the in-process benchmark, which measured a
+`GET hit` at ~360–430 ns by a completely different method. Two independent
+measurements agreeing to within a rounding error is far better evidence than
+either alone.
+
+**The uncomfortable implication is the useful one.** Every nanosecond won in
+Stages 2–4 — the O(1) eviction, the `optional` short-circuit that keeps the TTL
+check off the no-TTL path — is invisible from the far side of a socket. A
+50% faster cache would move this benchmark by about 1%. That is why the next
+stages are about concurrency and not micro-optimisation, and it is the argument
+for always measuring at the boundary the user actually sees.
+
+### These percentiles are real, unlike the in-process ones
+
+A round trip is ~20 µs against a **41 ns clock tick** — three orders of
+magnitude apart. So `p50 = 19.75 µs` is a measurement, not a tick count. Compare
+Stage 4, where the TTL check's 12 ns effect was completely invisible in the
+percentile table because the tick was three times larger than the effect.
+
+Same harness code, same clock; what changed is the ratio between the thing being
+measured and the instrument measuring it. That ratio is the whole question when
+deciding whether a percentile means anything.
+
+### What this baseline is for
+
+It is deliberately the *most pessimistic* configuration: one client, one request
+in flight, no pipelining, a server that handles one connection at a time. Every
+later stage gets compared against it:
+
+| | Status |
+| --- | --- |
+| single client → this baseline | ✅ recorded |
+| multiple clients against the single-threaded server | ⬜ Stage 7 |
+| multiple clients against a concurrent server | ⬜ Stage 7 |
+| sharded cache under concurrent load | ⬜ Stage 8 |
+
+### Limitations
+
+- **Loopback, not a network.** No NIC, no wire, no switch, and most of the IP stack is short-circuited. A real network adds tens to hundreds of microseconds and would make the cache's share of a request smaller still.
+- **Server and client share a machine**, and on an idle one they may well share a core's cache. Both processes' CPU time lands in the same measurement.
+- **No pipelining.** The server *does* handle several buffered commands per read, but the benchmark never sends them that way. Pipelining would amortise the round trip across many requests and change these numbers completely.
+- **One value size (64 B), one key size (16 B).** Larger values would start to make bandwidth matter.
 
 ---
 
@@ -303,8 +384,8 @@ order-alternated, rather than against a number recorded on another day.
 ## Known limitations
 
 - **Average and tick-quantised percentiles only.** No sub-tick resolution. ⬜ Stage 5.
-- **Single-threaded.** No contention, no scaling data. ⬜ Stage 8.
+- **Single-threaded.** No contention, no scaling data. ⬜ Stage 7.
 - **One key size, one value size.** 16-byte keys (small-string, no allocation) and 64-byte values (heap-allocated). Behaviour at other sizes is not characterised.
 - **Memory per entry is not measured.** ARCHITECTURE §6 gives an estimate from the data layout; that is not the same as a measurement. ⬜ Stage 11.
 - **Two synthetic distributions.** 80/20 skew and uniform. Real traffic is Zipfian with a time-varying hot set, and neither of these captures a working set that shifts.
-- **In-process.** No sockets, no protocol parsing, no syscalls. Expect these per-operation costs to be dwarfed by network cost once Stage 6 lands.
+- **In-process.** No sockets, no protocol parsing, no syscalls. The Stage 5 section above measures the same cache over TCP, where these per-operation costs turn out to be 2-3% of a request.
