@@ -1,0 +1,19 @@
+#pragma once
+
+// Generated from include/cachex/version.hpp.in by CMake's configure_file().
+// The version number is declared once, in the top-level project() call, and
+// flows from there into both the build system and the binary. Editing this
+// file directly has no effect -- edit CMakeLists.txt instead.
+
+#include <string>
+
+namespace cachex {
+
+inline constexpr int kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr int kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr int kVersionPatch = @PROJECT_VERSION_PATCH@;
+
+/// Returns the version as "major.minor.patch", e.g. "0.1.0".
+std::string version_string();
+
+}  // namespace cachex
