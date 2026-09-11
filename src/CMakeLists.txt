@@ -10,6 +10,8 @@ configure_file(
 # This is what lets the tests link against the same code the server runs,
 # instead of the tests rebuilding their own copy of it.
 add_library(cachex_core
+  cache.cpp
+  recency_list.cpp
   version.cpp)
 
 target_include_directories(cachex_core PUBLIC

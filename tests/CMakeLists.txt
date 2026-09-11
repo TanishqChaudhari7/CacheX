@@ -1,5 +1,7 @@
 add_executable(cachex_tests
   test_main.cpp
+  cache_test.cpp
+  recency_list_test.cpp
   version_test.cpp)
 
 # The test framework header sits next to the test sources.
