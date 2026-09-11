@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <optional>
 #include <string>
@@ -9,6 +10,25 @@
 #include "cachex/recency_list.hpp"
 
 namespace cachex {
+
+/// The three states a key's time-to-live can be in.
+///
+/// Redis encodes these in one integer with two magic values (-2 missing, -1 no
+/// expiry, >= 0 remaining). A type makes the three cases explicit instead, so a
+/// caller cannot accidentally treat "missing" as a duration.
+enum class TtlState {
+  Missing,     ///< No such key: never set, or erased, evicted, or expired.
+  Persistent,  ///< The key exists and will not expire on its own.
+  Expiring,    ///< The key exists and has a deadline.
+};
+
+struct TtlInfo {
+  TtlState state = TtlState::Missing;
+  /// Time left before expiry. Only meaningful when state == Expiring; zero
+  /// otherwise. Truncated toward zero, so a key with 0.4 ms left reports 0 ms
+  /// while still being Expiring.
+  std::chrono::milliseconds remaining{0};
+};
 
 /// A single-threaded in-memory key-value cache with optional LRU eviction.
 ///
@@ -32,25 +52,57 @@ class Cache {
   /// least recently used one. A capacity of 0 is legal and stores nothing.
   explicit Cache(std::size_t capacity);
 
+  using Clock = Entry::Clock;
+  using Duration = std::chrono::milliseconds;
+
   /// Inserts a new entry or overwrites an existing one, and marks the key as most
   /// recently used. Inserting at capacity evicts the least recently used entry.
+  /// The entry never expires; if the key already had a TTL, **this clears it**
+  /// -- a set replaces the whole entry, expiry included, as Redis's SET does.
   /// O(1) average, including the eviction.
   void set(std::string key, std::string value);
+
+  /// As above, but the entry expires `ttl` from now.
+  ///
+  /// A `ttl` of zero or less **erases the key and stores nothing**. The entry
+  /// could never be read, and storing it would occupy capacity and could evict a
+  /// live entry. The invariant that falls out: after set(k, v, ttl), the key is
+  /// visible if and only if ttl > 0.
+  ///
+  /// Accepts any coarser chrono duration implicitly, so set(k, v, seconds(30))
+  /// compiles. O(1) average.
+  void set(std::string key, std::string value, Duration ttl);
+
+  /// Reports whether the key exists, never expires, or expires -- and if so, how
+  /// long is left. Expired entries are reclaimed on the way through, which is
+  /// why this is not const. Does *not* count as a use: querying metadata should
+  /// not rescue a key from eviction. O(1) average.
+  TtlInfo ttl(const std::string& key);
 
   /// Returns a *copy* of the value, or nullopt if the key is absent.
   /// A hit counts as a use and reorders the entry -- which is why it is not const.
   /// O(1) average.
   std::optional<std::string> get(const std::string& key);
 
-  /// Removes a key. Returns false if it was not present. O(1) average.
+  /// Removes a key. Returns false if it was not present.
+  /// An expired-but-not-yet-reclaimed entry counts as not present: it is
+  /// reclaimed, and the call returns false, because nothing user-visible was
+  /// removed. O(1) average.
   bool erase(const std::string& key);
 
   /// Tests for a key *without* counting as a use, so recency order is unchanged
   /// and the method can be const. A key that is only ever peeked at still ages
-  /// out. O(1) average.
+  /// out.
+  ///
+  /// An expired entry reports false but is **not** reclaimed -- reclaiming would
+  /// mutate, and this is the one deliberately non-mutating peek. Reclamation is
+  /// left to the next get() or ttl(). O(1) average.
   bool contains(const std::string& key) const;
 
-  /// Number of entries currently stored. Never exceeds capacity(). O(1).
+  /// Number of entries *resident*, which under lazy expiration includes expired
+  /// entries not yet reclaimed. It is therefore an upper bound on the number of
+  /// visible keys, not a count of them. Redis's DBSIZE behaves the same way.
+  /// Counting only live keys would mean scanning -- O(n). O(1).
   std::size_t size() const noexcept { return index_.size(); }
   bool empty() const noexcept { return index_.empty(); }
 
@@ -65,11 +117,25 @@ class Cache {
   /// lifetime statistics. Explicit erase() is not an eviction and is not counted.
   std::size_t evictions() const noexcept { return evictions_; }
 
+  /// Entries removed because they were found expired, cumulative over the
+  /// cache's lifetime. Like evictions(), not reset by clear().
+  std::size_t expired_removals() const noexcept { return expired_removals_; }
+
   /// Keys from most to least recently used -- so `.back()` is the next victim.
+  /// Includes expired entries that have not been reclaimed yet.
   /// Diagnostic only: O(n) and allocates. The server never calls it.
   std::vector<std::string> keys_by_recency() const;
 
  private:
+  using Index = std::unordered_map<std::string, RecencyList::Iterator>;
+
+  /// The shared body of both set() overloads.
+  void store(std::string key, std::string value,
+             std::optional<Clock::time_point> expires_at);
+
+  /// Removes an entry from both structures, in the only safe order. O(1).
+  void remove(Index::iterator it);
+
   /// Removes the least recently used entry from both structures. O(1).
   void evict_oldest();
 
@@ -77,10 +143,11 @@ class Cache {
   // Declared in this order so that on destruction index_ (the borrower) is
   // destroyed before entries_ (the owner).
   RecencyList entries_;
-  std::unordered_map<std::string, RecencyList::Iterator> index_;
+  Index index_;
 
   std::optional<std::size_t> capacity_;
   std::size_t evictions_ = 0;
+  std::size_t expired_removals_ = 0;
 };
 
 }  // namespace cachex

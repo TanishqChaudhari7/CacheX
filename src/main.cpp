@@ -1,6 +1,8 @@
+#include <chrono>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "cachex/cache.hpp"
 #include "cachex/version.hpp"
@@ -57,5 +59,36 @@ int main() {
   std::cout << "  contains b -> " << lru.contains("b")
             << ", contains a -> " << lru.contains("a")
             << ", evictions -> " << lru.evictions() << "\n";
+
+  std::cout << "\n[3] TTL (lazy expiration)\n";
+  using namespace std::chrono_literals;
+  cachex::Cache ttl_cache;
+  ttl_cache.set("permanent", "stays");
+  ttl_cache.set("fleeting", "goes", 50ms);
+
+  const auto describe = [&ttl_cache](const char* key) {
+    const cachex::TtlInfo info = ttl_cache.ttl(key);
+    std::cout << "  ttl " << key << " -> ";
+    switch (info.state) {
+      case cachex::TtlState::Missing:
+        std::cout << "missing\n";
+        break;
+      case cachex::TtlState::Persistent:
+        std::cout << "no expiry\n";
+        break;
+      case cachex::TtlState::Expiring:
+        std::cout << info.remaining.count() << " ms left\n";
+        break;
+    }
+  };
+  describe("permanent");
+  describe("fleeting");
+
+  std::cout << "  ... waiting 150 ms ...\n";
+  std::this_thread::sleep_for(150ms);
+  describe("permanent");
+  describe("fleeting");
+  std::cout << "  size -> " << ttl_cache.size() << ", expired removals -> "
+            << ttl_cache.expired_removals() << "\n";
   return 0;
 }

@@ -6,13 +6,99 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §8](../ARCHITECTURE.md#8-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §9](../ARCHITECTURE.md#9-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
 ./build/release/bin/cachex_bench
 ```
+
+---
+
+## Stage 4 — TTL (lazy expiration)
+
+| | |
+| --- | --- |
+| Date | 2026-09-11 |
+| Machine | Apple M2 Pro, 12 cores, 16 GB RAM |
+| OS | macOS 26.5.2 (arm64) |
+| Compiler | AppleClang 21.0.0, `-O3 -DNDEBUG`, C++17 |
+| Clock | `steady_clock`, measured: ~21–38 ns per `now()`, **41 ns tick** |
+
+Stage 3's numbers below are unchanged; this section covers what TTL added.
+
+### The cost of the expiry check
+
+The question: how much does checking `expires_at` slow down a `GET` hit? Measured
+with the same paired, order-alternated method as the LRU A/B in section 2 —
+100,000 GET hits over a shuffled order, 15 repeats per invocation.
+
+```
+case                                 ops/sec    avg (ns)     reclaimed
+----------------------------------------------------------------------
+a) GET hit, no TTL                   9622286       103.9             0
+b) GET hit, TTL set                  8598360       116.3             0
+c) GET, all entries expired          6348316       157.5        100000
+```
+
+Paired `(b)` against `(a)`, **20 invocations** (each a median of 15 paired repeats):
+
+| | |
+| --- | ---: |
+| Median | **+12.3%** |
+| Middle half (p25–p75) | +11.7% to +12.7% |
+| Full range | +1.8% to +28.1% |
+| Samples above zero | **20 of 20** |
+
+**The TTL check costs about 12% of a GET hit** — roughly 12 ns on a ~104 ns
+operation, which is about what a single `steady_clock::now()` read costs. That is
+exactly what the check adds when the entry has a deadline.
+
+The number worth trusting most is not the median but the **sign consistency**:
+every one of 20 measurements came out positive. A null effect would land negative
+roughly half the time. The magnitude estimate is looser than a first batch of five
+runs suggested (those happened to fall in a tight +11.7% to +12.7% band and were
+not representative of the spread).
+
+**Contrast this with section 2**, where the LRU capacity check straddled zero under
+the *identical* method and was reported as unresolvable. Two effects, one method,
+two different verdicts — which is the evidence that the harness distinguishes
+signal from noise rather than always shrugging.
+
+### Three things this measurement shows
+
+1. **Keys without a TTL pay nothing.** `expires_at` is a `std::optional`, and
+   `has_value()` is tested *before* the clock is read. Case (a) is the no-TTL
+   path and it is the fastest of the three. The cost is borne only by keys that
+   asked for a TTL.
+
+2. **The latency percentiles cannot see this effect at all:**
+
+   ```
+     latency (ns)    samples       mean       p50       p95       p99         max
+     ----------------------------------------------------------------------------
+     no TTL           100000      217.4     208.0     458.0     625.0     13041.0
+     TTL set          100000      214.9     208.0     458.0     583.0      7291.0
+     expired          100000      229.1     167.0     500.0     708.0      7833.0
+   ```
+
+   `p50` reads 208 ns for both cases, because the clock's **41 ns tick** is more
+   than three times larger than the 12 ns difference being measured. The
+   throughput measurement resolves what the percentile table structurally cannot.
+   This is the clearest argument in the project for reporting both.
+
+3. **Walking a cache of entirely expired entries** runs at ~6.3M ops/sec against
+   ~9.6M for live hits. That is not the same operation being slower: those calls
+   return nothing *and* delete an entry. It is reported to show what a sea of
+   expired entries costs to traverse once — and case (c) varies far more between
+   runs (183–333 ns/op observed) because it is allocator-teardown bound.
+
+### What is still deterministic
+
+The `reclaimed` count is exactly 100,000 every run, and the checksum is
+byte-identical across all 20 invocations. Expiry behaviour is reproducible; only
+its timing is not.
 
 ---
 

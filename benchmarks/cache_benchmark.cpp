@@ -8,6 +8,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cachex/cache.hpp"
@@ -27,6 +28,7 @@ constexpr std::size_t kValueBytes = 64;
 constexpr std::uint32_t kSeed = 42;
 constexpr int kRepeats = 5;
 constexpr int kAbRepeats = 15;  // the A/B in section 2 needs a tighter error bar
+constexpr std::size_t kTtlKeys = 100000;  // section 6
 
 // Written to by every phase and printed at the end. Without an observable use of
 // the results, the optimiser is free to delete the calls being measured.
@@ -347,6 +349,54 @@ LatencyPair run_latency(cachex::Cache& cache, const std::vector<Request>& reques
   return LatencyPair{summarize(get_ns), summarize(set_ns)};
 }
 
+// --- section 6: TTL --------------------------------------------------------
+
+/// Fills a cache with `count` keys, either persistent or with the given TTL.
+void fill_cache(cachex::Cache& cache, const std::vector<std::string>& keys,
+                std::size_t count, const std::string& value,
+                std::optional<cachex::Cache::Duration> ttl) {
+  for (std::size_t i = 0; i < count; ++i) {
+    if (ttl.has_value()) {
+      cache.set(keys[i], value, *ttl);
+    } else {
+      cache.set(keys[i], value);
+    }
+  }
+}
+
+Nanos time_get_pass(cachex::Cache& cache, const std::vector<std::string>& keys,
+                    const std::vector<std::size_t>& order) {
+  std::uint64_t acc = 0;
+  const auto start = Clock::now();
+  for (const std::size_t i : order) {
+    if (const auto found = cache.get(keys[i])) {
+      acc += found->size();
+    }
+  }
+  const auto elapsed = std::chrono::duration_cast<Nanos>(Clock::now() - start);
+  g_sink += acc;
+  return elapsed;
+}
+
+Latency latency_of_get_pass(cachex::Cache& cache,
+                            const std::vector<std::string>& keys,
+                            const std::vector<std::size_t>& order) {
+  std::vector<std::int64_t> samples;
+  samples.reserve(order.size());
+  std::uint64_t acc = 0;
+  for (const std::size_t i : order) {
+    const auto t0 = Clock::now();
+    const auto found = cache.get(keys[i]);
+    const auto t1 = Clock::now();
+    samples.push_back(std::chrono::duration_cast<Nanos>(t1 - t0).count());
+    if (found) {
+      acc += found->size();
+    }
+  }
+  g_sink += acc;
+  return summarize(samples);
+}
+
 // --- printing --------------------------------------------------------------
 
 void print_phase_row(const char* label, Nanos duration, std::size_t ops) {
@@ -654,6 +704,114 @@ int main() {
               << std::setprecision(2) << hit_rate << "%" << std::setw(14)
               << o.evictions << std::setw(14) << std::setprecision(0)
               << ops_per_sec(o.total, kWorkloadOps) << "\n";
+  }
+
+  // =========================================================================
+  // TTL is not free, and the point of this section is to say how much it costs
+  // rather than to assert that it does not. Three cases, because they exercise
+  // three different code paths:
+  //
+  //   a) no TTL          -- expires_at is nullopt, so the check short-circuits
+  //                         before ever reading the clock
+  //   b) long TTL        -- the check runs in full: a clock read and a compare
+  //                         on every hit, and nothing ever expires
+  //   c) expired entries -- every get finds a corpse and reclaims it
+  //
+  // (a) vs (b) is the honest measure of "what does the check cost", so it uses
+  // the same paired, order-alternated method as section 2.
+  std::cout << "\n\n6. COST OF TTL CHECKS\n"
+            << "   " << kTtlKeys << " GET hits over a shuffled order, paired and\n"
+            << "   order-alternated, " << kAbRepeats << " repeats\n\n";
+
+  std::vector<std::size_t> ttl_order(kTtlKeys);
+  std::iota(ttl_order.begin(), ttl_order.end(), std::size_t{0});
+  std::shuffle(ttl_order.begin(), ttl_order.end(), std::mt19937(kSeed));
+
+  std::vector<Nanos> no_ttl_runs;
+  std::vector<Nanos> with_ttl_runs;
+  std::vector<double> ttl_ratio;
+  for (int i = 0; i < kAbRepeats; ++i) {
+    const bool no_ttl_first = (i % 2) == 0;
+    Nanos no_ttl_time{0};
+    Nanos with_ttl_time{0};
+
+    for (int pass = 0; pass < 2; ++pass) {
+      if ((pass == 0) == no_ttl_first) {
+        cachex::Cache cache;
+        fill_cache(cache, keys, kTtlKeys, value, std::nullopt);
+        no_ttl_time = time_get_pass(cache, keys, ttl_order);
+      } else {
+        cachex::Cache cache;
+        // Far enough out that nothing expires mid-run: this measures the check,
+        // not the reclaim path, which case (c) covers separately.
+        fill_cache(cache, keys, kTtlKeys, value, std::chrono::minutes(10));
+        with_ttl_time = time_get_pass(cache, keys, ttl_order);
+      }
+    }
+    no_ttl_runs.push_back(no_ttl_time);
+    with_ttl_runs.push_back(with_ttl_time);
+    ttl_ratio.push_back(static_cast<double>(with_ttl_time.count()) /
+                        static_cast<double>(no_ttl_time.count()));
+  }
+  std::sort(ttl_ratio.begin(), ttl_ratio.end());
+
+  // (c) every entry is already expired, so every get reclaims one.
+  cachex::Cache expired_cache;
+  fill_cache(expired_cache, keys, kTtlKeys, value, cachex::Cache::Duration(1));
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  const Nanos expired_time = time_get_pass(expired_cache, keys, ttl_order);
+
+  std::cout << std::left << std::setw(30) << "case" << std::right
+            << std::setw(14) << "ops/sec" << std::setw(12) << "avg (ns)"
+            << std::setw(14) << "reclaimed" << "\n"
+            << std::string(70, '-') << "\n";
+  const auto ttl_row = [](const char* label, Nanos d, std::size_t reclaimed) {
+    std::cout << std::left << std::setw(30) << label << std::right
+              << std::setw(14) << std::fixed << std::setprecision(0)
+              << ops_per_sec(d, kTtlKeys) << std::setw(12)
+              << std::setprecision(1) << avg_ns(d, kTtlKeys) << std::setw(14)
+              << reclaimed << "\n";
+  };
+  ttl_row("a) GET hit, no TTL", median(no_ttl_runs), 0);
+  ttl_row("b) GET hit, TTL set", median(with_ttl_runs), 0);
+  ttl_row("c) GET, all entries expired", expired_time,
+          expired_cache.expired_removals());
+
+  const auto ttl_percent = [](double ratio) { return 100.0 * (ratio - 1.0); };
+  std::cout << "\n  Cost of the check itself -- (b) against (a), paired per repeat:\n"
+            << "    median " << std::showpos << std::fixed << std::setprecision(1)
+            << ttl_percent(ttl_ratio[ttl_ratio.size() / 2]) << "%"
+            << "   middle half " << ttl_percent(ttl_ratio[ttl_ratio.size() / 4])
+            << "% to " << ttl_percent(ttl_ratio[ttl_ratio.size() * 3 / 4]) << "%"
+            << "   full range " << ttl_percent(ttl_ratio.front()) << "% to "
+            << ttl_percent(ttl_ratio.back()) << "%" << std::noshowpos << "\n"
+            << "  Case (c) is a different path, not merely a slower one: those\n"
+            << "  gets return nothing and delete an entry, so it is not\n"
+            << "  comparable to (a) or (b). It is reported to show what a sea of\n"
+            << "  expired entries costs to walk through once.\n";
+
+  {
+    cachex::Cache no_ttl;
+    fill_cache(no_ttl, keys, kTtlKeys, value, std::nullopt);
+    cachex::Cache with_ttl;
+    fill_cache(with_ttl, keys, kTtlKeys, value, std::chrono::minutes(10));
+    cachex::Cache expired;
+    fill_cache(expired, keys, kTtlKeys, value, cachex::Cache::Duration(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    std::cout << "\n"
+              << std::left << std::setw(14) << "  latency (ns)" << std::right
+              << std::setw(11) << "samples" << std::setw(11) << "mean"
+              << std::setw(10) << "p50" << std::setw(10) << "p95"
+              << std::setw(10) << "p99" << std::setw(12) << "max" << "\n"
+              << "  " << std::string(76, '-') << "\n";
+    print_latency_row("  no TTL", latency_of_get_pass(no_ttl, keys, ttl_order));
+    print_latency_row("  TTL set", latency_of_get_pass(with_ttl, keys, ttl_order));
+    print_latency_row("  expired", latency_of_get_pass(expired, keys, ttl_order));
+    std::cout << "  (each sample includes ~" << std::fixed << std::setprecision(1)
+              << clock_ns << " ns of clock-read overhead, and is quantised to the\n"
+              << "   clock's " << tick_ns
+              << " ns tick -- so these are tick counts, not fine-grained times)\n";
   }
 
   std::cout << "\nchecksum: " << g_sink

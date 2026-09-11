@@ -14,23 +14,26 @@ it, and the full roadmap.
 
 ## Status
 
-**Stage 3 of 11 — LRU eviction.**
+**Stage 4 of 11 — TTL (lazy expiration).**
 
-The cache enforces a fixed capacity and evicts the least recently used entry in
-**O(1)** — no scan to find a victim. 72 tests pass, including under
-AddressSanitizer/UndefinedBehaviorSanitizer and with zero leaks. The benchmark
-harness measures two workload types with latency percentiles and a hit-rate curve.
+Keys can carry a time-to-live and read as missing once it passes. Expiration is
+**lazy**: expired entries are reclaimed when an operation encounters them, with no
+background thread (see [why](ARCHITECTURE.md#65-why-there-is-no-background-cleanup-thread-yet)).
+Deadlines use a monotonic clock, so a wall-clock change cannot resurrect or
+mass-expire keys. 101 tests pass, including under
+AddressSanitizer/UndefinedBehaviorSanitizer and with zero leaks.
 
-There is still **no expiry, no networking, and no concurrency** — the cache is
-single-threaded by design at this stage.
+There is still **no networking and no concurrency** — the cache is single-threaded
+by design at this stage.
 
 | | |
 | --- | --- |
 | ✅ Stage 1 | CMake build, Debug/Release, strict warnings, test framework |
 | ✅ Stage 2 | Core cache (`unordered_map` + `std::list`), benchmark baseline |
-| ✅ Stage 3 | Fixed capacity, O(1) LRU eviction, 72 tests, workload benchmarks |
-| ⬜ Next | Stage 4 — per-key TTL |
-| ⬜ Later | benchmark harness II · TCP server · protocol · concurrency · sharding · persistence · optimisation |
+| ✅ Stage 3 | Fixed capacity, O(1) LRU eviction, workload benchmarks |
+| ✅ Stage 4 | Per-key TTL, lazy expiration, 101 tests, measured TTL cost |
+| ⬜ Next | Stage 5 — benchmark harness II (sub-tick latency) |
+| ⬜ Later | TCP server · protocol · concurrency · sharding · persistence · optimisation |
 
 ## API
 
@@ -52,6 +55,18 @@ cache.erase("user:1");                  // true  -- false if the key was absent
 cache.size();                           // 0
 lru.capacity();                         // optional<size_t>; nullopt if unbounded
 lru.evictions();                        // lifetime count of evicted entries
+
+// TTL
+cache.set("session", "abc", 30s);       // expires 30 s from now
+cache.set("session", "abc");            // a plain set CLEARS the TTL
+
+cachex::TtlInfo info = cache.ttl("session");
+switch (info.state) {
+  case cachex::TtlState::Missing:    break;  // absent, or already expired
+  case cachex::TtlState::Persistent: break;  // no expiry set
+  case cachex::TtlState::Expiring:   break;  // info.remaining ms left
+}
+cache.expired_removals();               // lifetime count of expired entries reclaimed
 ```
 
 All of `set`, `get`, `erase`, `contains`, `size`, **and eviction** are
@@ -69,7 +84,29 @@ LRU only means something once "recently used" is pinned down:
 | `get` hit | ✅ yes | The definition of LRU |
 | `set` (insert or update) | ✅ yes | A write is at least as strong a signal as a read — matches Redis and memcached |
 | `contains` | ❌ **no** | Peeking is not using: `EXISTS` must not keep dead data alive forever |
+| `ttl` | ❌ **no** | A metadata query should not rescue a key from eviction |
 | `erase` | ➖ n/a | Frees a slot, so the next insert need not evict |
+
+### TTL semantics
+
+| Case | Behaviour |
+| --- | --- |
+| `set(k, v)` on a key that had a TTL | TTL **cleared** — a set replaces the whole entry (Redis's `SET` default) |
+| `set(k, v, ttl)` with **`ttl <= 0`** | Erases the key, stores nothing. *After `set(k, v, ttl)`, the key is visible iff `ttl > 0`* |
+| `get` / `ttl` on an expired key | Reports missing **and reclaims** the entry |
+| `contains` on an expired key | Reports `false` but does **not** reclaim — it is the one non-mutating peek |
+| `erase` on an expired key | Returns `false` (nothing visible was removed) but reclaims it |
+| `size()` with expired entries present | **Counts them.** It reports entries *resident*, not *visible* — the cost of lazy expiration |
+
+Deadlines are stored as absolute `std::chrono::steady_clock` time points.
+`steady_clock` is monotonic, so an NTP correction or a manual clock change cannot
+resurrect an expired key or mass-expire the whole cache.
+
+> ⚠️ **CacheX's TTL is intentionally simplified and does not behave like Redis.**
+> Most importantly there is no active expiry sweep, so an expired key that is
+> never touched again is never reclaimed — and it keeps occupying capacity, where
+> it can evict a live entry. The full comparison is in
+> [ARCHITECTURE.md §6.6](ARCHITECTURE.md#66-what-redis-does-differently).
 
 **Not thread-safe.** One thread at a time; locking arrives in Stage 8.
 
@@ -147,8 +184,13 @@ Or run the binary directly for per-test results:
 [ RUN      ] new_cache_is_empty
 [       OK ] new_cache_is_empty
 ...
-72 / 72 tests passed
+101 / 101 tests passed
 ```
+
+The suite takes ~3 s, almost all of it the TTL tests sleeping. They use real
+time rather than an injectable clock; the tolerances are chosen so that only an
+order-of-magnitude stall could produce a flake, and 20 consecutive runs produced
+none.
 
 ### Under sanitizers
 
@@ -198,6 +240,7 @@ Five sections, all with a fixed seed and a discarded warm-up:
 3. **Workload A** — 90% GET / 10% SET, skewed keys, cache-aside: hit-dominated
 4. **Workload B** — 20% GET / 80% SET, uniform keys: eviction-dominated
 5. **Hit rate vs capacity** — the point of LRU, as a curve
+6. **Cost of TTL checks** — GET hits with no TTL, with a TTL, and over expired entries
 
 **A recorded baseline is in [benchmarks/RESULTS.md](benchmarks/RESULTS.md)**, with
 hardware, variance, and interpretation. The headline:
@@ -224,7 +267,7 @@ being requested. Random eviction would track capacity roughly linearly.
 > costs this in-process benchmark does not.
 
 Methodology — and what is deliberately *not* measured yet — is in
-[ARCHITECTURE.md §8](ARCHITECTURE.md#8-benchmark-methodology).
+[ARCHITECTURE.md §9](ARCHITECTURE.md#9-benchmark-methodology).
 
 ## Project layout
 
@@ -246,6 +289,7 @@ CacheX/
 │   ├── test_framework.hpp      ~100 lines, no dependencies
 │   ├── cache_test.cpp          cache semantics and edge cases
 │   ├── lru_test.cpp            capacity, eviction, recency ordering
+│   ├── ttl_test.cpp            expiry, TTL query, lazy reclamation
 │   ├── recency_list_test.cpp   ordering and iterator stability
 │   └── version_test.cpp
 ├── benchmarks/
@@ -265,7 +309,7 @@ exactly the code the server will run, rather than a second copy of it.
 | 1 | Project foundation | ✅ Done |
 | 2 | Core cache (`unordered_map` + doubly linked list) | ✅ Done |
 | 3 | LRU eviction | ✅ Done |
-| 4 | TTL / key expiry | ⬜ |
+| 4 | TTL / key expiry | ✅ Done |
 | 5 | Benchmark harness II (sub-tick latency) | ⬜ |
 | 6 | TCP server | ⬜ |
 | 7 | Client protocol | ⬜ |
@@ -274,4 +318,4 @@ exactly the code the server will run, rather than a second copy of it.
 | 10 | Persistence | ⬜ |
 | 11 | Final optimisation and benchmarking | ⬜ |
 
-Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#12-future-roadmap).
+Details for each stage are in [ARCHITECTURE.md](ARCHITECTURE.md#13-future-roadmap).

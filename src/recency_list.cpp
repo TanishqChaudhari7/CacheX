@@ -4,9 +4,8 @@
 
 namespace cachex {
 
-RecencyList::Iterator RecencyList::insert_newest(std::string key,
-                                                 std::string value) {
-  entries_.push_front(Entry{std::move(key), std::move(value)});
+RecencyList::Iterator RecencyList::insert_newest(Entry entry) {
+  entries_.push_front(std::move(entry));
   return entries_.begin();
 }
 

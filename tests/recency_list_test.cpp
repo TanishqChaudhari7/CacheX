@@ -27,9 +27,9 @@ CACHEX_TEST(list_starts_empty) {
 
 CACHEX_TEST(inserts_go_to_the_front) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
-  list.insert_newest("c", "3");
+  list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
+  list.insert_newest({"c", "3"});
 
   CHECK_EQ(order_of(list), "c,b,a");
   CHECK_EQ(list.size(), 3u);
@@ -37,7 +37,7 @@ CACHEX_TEST(inserts_go_to_the_front) {
 
 CACHEX_TEST(insert_returns_an_iterator_to_the_new_entry) {
   cachex::RecencyList list;
-  const auto it = list.insert_newest("key", "value");
+  const auto it = list.insert_newest({"key", "value"});
 
   CHECK_EQ(it->key, "key");
   CHECK_EQ(it->value, "value");
@@ -45,9 +45,9 @@ CACHEX_TEST(insert_returns_an_iterator_to_the_new_entry) {
 
 CACHEX_TEST(mark_used_moves_an_entry_to_the_front) {
   cachex::RecencyList list;
-  const auto a = list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
-  list.insert_newest("c", "3");
+  const auto a = list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
+  list.insert_newest({"c", "3"});
 
   list.mark_used(a);
   CHECK_EQ(order_of(list), "a,c,b");
@@ -55,8 +55,8 @@ CACHEX_TEST(mark_used_moves_an_entry_to_the_front) {
 
 CACHEX_TEST(mark_used_on_the_front_entry_is_a_no_op) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  const auto b = list.insert_newest("b", "2");
+  list.insert_newest({"a", "1"});
+  const auto b = list.insert_newest({"b", "2"});
 
   list.mark_used(b);
   CHECK_EQ(order_of(list), "b,a");
@@ -65,7 +65,7 @@ CACHEX_TEST(mark_used_on_the_front_entry_is_a_no_op) {
 
 CACHEX_TEST(mark_used_on_the_only_entry_is_a_no_op) {
   cachex::RecencyList list;
-  const auto only = list.insert_newest("solo", "1");
+  const auto only = list.insert_newest({"solo", "1"});
 
   list.mark_used(only);
   CHECK_EQ(order_of(list), "solo");
@@ -74,8 +74,8 @@ CACHEX_TEST(mark_used_on_the_only_entry_is_a_no_op) {
 
 CACHEX_TEST(mark_used_keeps_the_iterator_valid) {
   cachex::RecencyList list;
-  const auto a = list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
+  const auto a = list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
 
   list.mark_used(a);
   list.mark_used(a);  // splice relinks the node; `a` must still point at it
@@ -85,9 +85,9 @@ CACHEX_TEST(mark_used_keeps_the_iterator_valid) {
 
 CACHEX_TEST(erase_removes_only_the_named_entry) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  const auto b = list.insert_newest("b", "2");
-  list.insert_newest("c", "3");
+  list.insert_newest({"a", "1"});
+  const auto b = list.insert_newest({"b", "2"});
+  list.insert_newest({"c", "3"});
 
   list.erase(b);
   CHECK_EQ(order_of(list), "c,a");
@@ -96,9 +96,9 @@ CACHEX_TEST(erase_removes_only_the_named_entry) {
 
 CACHEX_TEST(oldest_reports_the_back_of_the_list) {
   cachex::RecencyList list;
-  const auto a = list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
-  list.insert_newest("c", "3");
+  const auto a = list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
+  list.insert_newest({"c", "3"});
 
   CHECK_EQ(list.oldest().key, "a");
 
@@ -109,9 +109,9 @@ CACHEX_TEST(oldest_reports_the_back_of_the_list) {
 
 CACHEX_TEST(pop_oldest_removes_from_the_back) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
-  list.insert_newest("c", "3");
+  list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
+  list.insert_newest({"c", "3"});
 
   list.pop_oldest();
   CHECK_EQ(order_of(list), "c,b");
@@ -124,8 +124,8 @@ CACHEX_TEST(pop_oldest_removes_from_the_back) {
 
 CACHEX_TEST(clear_empties_the_list) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  list.insert_newest("b", "2");
+  list.insert_newest({"a", "1"});
+  list.insert_newest({"b", "2"});
 
   list.clear();
   CHECK(list.empty());
@@ -138,12 +138,12 @@ CACHEX_TEST(clear_empties_the_list) {
 // references after the first reallocation.
 CACHEX_TEST(iterators_survive_insertions_and_erasures_of_other_entries) {
   cachex::RecencyList list;
-  list.insert_newest("a", "1");
-  const auto tracked = list.insert_newest("tracked", "value");
-  const auto c = list.insert_newest("c", "3");
+  list.insert_newest({"a", "1"});
+  const auto tracked = list.insert_newest({"tracked", "value"});
+  const auto c = list.insert_newest({"c", "3"});
 
   for (int i = 0; i < 500; ++i) {
-    list.insert_newest("filler" + std::to_string(i), "x");
+    list.insert_newest({"filler" + std::to_string(i), "x"});
   }
   list.erase(c);
   list.pop_oldest();  // removes "a"
@@ -159,7 +159,7 @@ CACHEX_TEST(iterators_survive_insertions_and_erasures_of_other_entries) {
 CACHEX_TEST(entries_store_independent_copies) {
   cachex::RecencyList list;
   std::string value = "original";
-  const auto it = list.insert_newest("k", value);
+  const auto it = list.insert_newest({"k", value});
   value = "changed-after-insert";
 
   CHECK_EQ(it->value, "original");

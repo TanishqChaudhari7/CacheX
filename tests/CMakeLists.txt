@@ -2,6 +2,7 @@ add_executable(cachex_tests
   test_main.cpp
   cache_test.cpp
   lru_test.cpp
+  ttl_test.cpp
   recency_list_test.cpp
   version_test.cpp)
 
