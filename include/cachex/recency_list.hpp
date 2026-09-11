@@ -42,8 +42,8 @@ class RecencyList {
   /// Removes an entry. O(1). Invalidates only `it`.
   void erase(Iterator it);
 
-  /// The least recently used entry. O(1). Undefined if the list is empty.
-  /// Not called by Cache yet -- this is the hook Stage 3 eviction will use.
+  /// The least recently used entry -- the eviction candidate. O(1).
+  /// Undefined if the list is empty.
   const Entry& oldest() const;
 
   /// Removes the least recently used entry. O(1). Undefined if empty.

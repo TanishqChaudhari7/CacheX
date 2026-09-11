@@ -6,7 +6,7 @@
 > machine, and do not compare them to Redis — Redis pays network and protocol
 > costs this in-process benchmark does not.
 
-Methodology: [ARCHITECTURE.md §7](../ARCHITECTURE.md#7-benchmark-methodology).
+Methodology: [ARCHITECTURE.md §8](../ARCHITECTURE.md#8-benchmark-methodology).
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
@@ -16,7 +16,7 @@ cmake --build build/release -j
 
 ---
 
-## Stage 2 baseline — core cache, single-threaded, unbounded
+## Stage 3 — LRU eviction
 
 | | |
 | --- | --- |
@@ -25,125 +25,200 @@ cmake --build build/release -j
 | OS | macOS 26.5.2 (arm64) |
 | Compiler | AppleClang 21.0.0, `-O3 -DNDEBUG`, C++17 |
 | CacheX version | 0.1.0 |
-| Sample | 12 invocations of the binary, each itself reporting the median of 5 internal repeats |
+| Clock | `steady_clock`, measured: ~21 ns per `now()`, **41 ns tick** |
 
-### Headline numbers
+### What is deterministic, and what is not
 
-Median across all 12 invocations, with the full observed range:
-
-| phase | median ops/sec | median latency | observed latency range |
-| --- | ---: | ---: | --- |
-| SET insert | 6,690,725 | 150 ns | 133 – 186 ns |
-| SET update | 1,877,021 | 533 ns | 361 – 763 ns |
-| GET hit | 3,021,391 | 331 ns | 234 – 477 ns |
-| GET miss | 19,833,811 | 50 ns | 40 – 54 ns |
-| CONTAINS | 17,874,566 | 56 ns | 41 – 66 ns |
-| ERASE | 3,742,265 | 267 ns | 181 – 383 ns |
-
-Raw output of one representative invocation:
+Every *behavioural* number the harness reports is byte-identical across runs —
+hit rate, miss count, fills, evictions, resident entries, and the checksum:
 
 ```
-CacheX 0.1.0 benchmark
-=================================
-
-build        : Release
-compiler     : AppleClang 21.0.0.21000101
-operations   : 200000 per phase
-key size     : 16 bytes (fits small-string storage)
-value size   : 64 bytes (heap allocated)
-repeats      : 5, median reported
-seed         : 42
-clock        : std::chrono::steady_clock
-
-phase                ops  total (ms)       ops/sec    avg (ns)
---------------------------------------------------------------
-SET insert        200000       28.11       7114073       140.6
-SET update        200000       80.69       2478706       403.4
-GET hit           200000       54.69       3657112       273.4
-GET miss          200000       10.18      19645883        50.9
-CONTAINS          200000       11.38      17568003        56.9
-ERASE             200000       44.97       4447714       224.8
-
-checksum: 79200000  (printed only so the optimiser cannot discard the work)
+hit rate   : 84.21%  (151475 hits, 28407 misses)     <- identical, all runs
+evictions  : 31495,  entries resident: 40000         <- identical, all runs
+checksum: 331827648                                  <- identical, all runs
 ```
+
+Only the *timings* vary. That split is the point: it means a change in hit rate
+between two versions of CacheX is a real behavioural change and never noise,
+while a change in throughput needs the caveats below.
 
 ---
 
-## ⚠️ The variance is much larger than it looks — read this before comparing anything
+## 1. Core operations (unbounded cache)
 
-Three phases — `SET update`, `GET hit`, and `ERASE` — do not vary smoothly. Across
-12 invocations of the *same binary* on the *same machine*, they fell into two
-distinct clusters roughly **2× apart**, with almost nothing in between:
+Continuity with the Stage 2 baseline — the same six phases, unchanged code paths.
+Average latency in ns, across 5 invocations (each a median of 5 internal repeats):
 
-| phase | fast cluster | slow cluster | ratio |
+| phase | run 1 | run 2 | run 3 | run 4 | run 5 | spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| SET insert | 150.7 | 141.4 | 141.1 | 152.4 | 151.4 | ~8% |
+| SET update | 717.3 | 696.2 | 689.7 | 710.4 | 735.9 | ~7% |
+| GET hit | 406.6 | 432.2 | 426.8 | 414.6 | 428.9 | ~6% |
+| GET miss | 45.9 | 46.1 | 44.3 | 50.1 | 50.0 | ~13% |
+| CONTAINS | 49.4 | 48.9 | 51.7 | 58.7 | 57.4 | ~19% |
+| ERASE | 353.2 | 363.7 | 393.5 | 347.0 | 396.3 | ~14% |
+
+The relationships from Stage 2 still hold, unchanged by adding LRU:
+`CONTAINS ≈ GET miss` (the hash lookup alone), `GET hit` ≈ 8× `CONTAINS` (the
+splice plus the 64-byte value copy), and `SET update` ≈ 4.7× `SET insert` despite
+doing strictly less work, purely because it walks a shuffled order through
+scattered nodes.
+
+---
+
+## 2. What LRU costs
+
+The question: how much does the capacity check slow down a cache that never
+actually evicts? Measured by replaying one identical request sequence against an
+unbounded cache and a bounded cache with enough headroom that it evicts nothing —
+paired within each repeat and with the running order alternated.
+
+Typical run:
+
+```
+configuration                            ops/sec    avg (ns)    evictions
+-------------------------------------------------------------------------
+unbounded (no LRU)                       9485491       105.4            0
+bounded, capacity = key space            9415771       106.2            0
+bounded, capacity = 10% of keys          7105248       140.7        80196
+```
+
+Paired comparison, median across 5 invocations of 15 repeats each:
+
+| run | median | middle half |
+| --- | ---: | --- |
+| 1 | −5.7% | −13.9% to +5.0% |
+| 2 | +1.1% | −5.0% to +7.2% |
+| 3 | −1.0% | −9.0% to +4.1% |
+| 4 | +6.2% | −3.3% to +11.3% |
+| 5 | −4.9% | −10.9% to +20.2% |
+
+**The result straddles zero in every run.** The honest conclusion is that the
+cost of the capacity check is *below this harness's noise floor* — which is the
+expected outcome for one predictable, almost-never-taken branch per insert.
+
+**This is explicitly not a claim that LRU is free.** It is a statement that the
+experiment cannot resolve a cost this small. Claiming a 0% overhead from data
+that also "shows" −5.7% and +6.2% would be reading noise as signal.
+
+Two measurement bugs had to be fixed before even this much was trustworthy, and
+both are worth knowing about:
+
+- **Comparing two independent medians** let machine drift between the two measurements masquerade as a result. Fixed by pairing the comparison within each repeat.
+- **Always running the unbounded case first** made the bounded case look consistently ~8% *faster* — impossible, since it does strictly more work. The first run pays for heap growth that the second then reuses. Fixed by alternating the order between repeats.
+
+The third row is listed but **is not comparable to the other two**: it holds a
+tenth of the data, so its memory access pattern differs as much as its workload
+does. The ~34% gap there is mostly a different cache-locality regime, not the
+cost of eviction.
+
+---
+
+## 3. Workload A — mostly hits (90% GET / 10% SET, cache-aside)
+
+80/20 skewed keys over a 100,000-key space, capacity 40,000, measured at steady
+state after a discarded warm-up pass.
+
+```
+  requests   : 200000  (179882 GET, 20118 SET)
+  throughput : 7012623 ops/sec (142.6 ns/op per application request)
+  hit rate   : 84.21%  (151475 hits, 28407 misses)
+  fills      : 28407 (cache-aside populations on miss)
+  evictions  : 31495,  entries resident: 40000
+
+  latency (ns)    samples       mean       p50       p95       p99         max
+  ----------------------------------------------------------------------------
+  GET              179882       91.1      83.0     125.0     167.0     18292.0
+  SET               48525      204.0     208.0     333.0     375.0      6375.0
+```
+
+Throughput across 5 invocations: 6.97M, 6.87M, 6.88M, 6.79M, 6.88M ops/sec —
+about 2.6% spread, far tighter than the Stage 2 core phases, because the steady
+state avoids the cold-start transient and the map's growth rehashes.
+
+---
+
+## 4. Workload B — heavy churn (20% GET / 80% SET, cache-aside)
+
+Uniform keys over 100,000, capacity 5,000. No hot set exists, so there is nothing
+for LRU to retain — the worst case for any eviction policy.
+
+```
+  requests   : 200000  (40085 GET, 159915 SET)
+  throughput : 4741392 ops/sec (210.9 ns/op per application request)
+  hit rate   : 4.92%  (1971 hits, 38114 misses)
+  fills      : 38114 (cache-aside populations on miss)
+  evictions  : 189939,  entries resident: 5000
+
+  latency (ns)    samples       mean       p50       p95       p99         max
+  ----------------------------------------------------------------------------
+  GET               40085       63.6      42.0     125.0     125.0      5708.0
+  SET              198029      205.6     208.0     292.0     334.0     12041.0
+```
+
+Throughput across 5 invocations: 4.60M, 4.61M, 4.63M, 4.68M, 4.49M ops/sec (~4%).
+
+**Churn costs about 1.5× per request** versus the hit-heavy workload (211 ns vs
+143 ns). The reason is visible in the counters: 189,939 evictions against 31,495,
+and almost every miss pays for a failed lookup, an insert, *and* an eviction.
+
+Note the hit rate of 4.9%, which is roughly capacity ÷ key space (5%). That is
+what LRU looks like when the access pattern has no locality to exploit: it
+performs no better than chance, because there is no "recently used" signal to
+act on. It is not a defect in the implementation — it is the honest answer to
+"what does a cache do for a workload that a cache cannot help?"
+
+---
+
+## 5. ⭐ Hit rate vs capacity — the point of LRU
+
+Same request sequence, same skewed distribution, only capacity varies:
+
+| capacity | entries | hit rate | evictions |
 | --- | ---: | ---: | ---: |
-| SET update | ~2.2 – 2.8 M ops/s | ~1.3 – 1.6 M ops/s | 1.9× |
-| GET hit | ~3.7 – 4.3 M ops/s | ~2.1 – 2.4 M ops/s | 1.8× |
-| ERASE | ~4.4 – 5.5 M ops/s | ~2.6 – 3.0 M ops/s | 1.8× |
+| 1% | 1,000 | 3.32% | 193,372 |
+| 5% | 5,000 | 15.92% | 168,125 |
+| 10% | 10,000 | 30.92% | 138,149 |
+| 20% | 20,000 | 57.78% | 84,385 |
+| 40% | 40,000 | **84.21%** | 31,495 |
+| 100% | 100,000 | 100.00% | 0 |
 
-The other three phases (`SET insert`, `GET miss`, `CONTAINS`) stayed within about
-±20% throughout and showed no clustering.
+This is the strongest evidence in the project that eviction is choosing the
+**right** victims. Hit rate rises much faster than capacity does — 40% of the
+memory buys 84% of the hits — because the entries being retained are the ones
+actually being requested. A policy that evicted at random would track capacity
+roughly linearly and would land near 40% here, not 84%.
 
-**The cause was not established.** What is known:
-
-- The binary was byte-identical across all runs, and the printed `checksum` was identical every time — the *work* is deterministic, only the *timing* is not.
-- The slow cluster was first seen while Spotlight (`mds_stores`) was at ~96% CPU. But the slow cluster persisted after Spotlight dropped to 0%, and the fast cluster later returned while a WebKit process was at 100% CPU. **Simple CPU contention does not explain it.**
-- The three affected phases are exactly the three that chase pointers through 200,000 scattered list nodes in shuffled order. The three unaffected phases are the ones that do a single hash lookup and stop.
-
-The most plausible explanation — offered as a **hypothesis, not a finding** — is
-performance-core vs. efficiency-core scheduling. Apple Silicon migrates processes
-between core types based on system state, and E-cores have smaller caches and less
-memory bandwidth. That would hit memory-latency-bound work hard and hash-lookup
-work barely, and it would produce two clusters rather than a smooth spread —
-which is what was observed. Confirming it needs per-core instrumentation that is
-out of scope here.
-
-### What this means in practice
-
-1. **Absolute numbers from different sittings are not comparable.** On this machine a 2× difference can appear with no code change at all.
-2. **Ratios within a single run are stable and are the trustworthy signal.** Every relationship in the next section held in *both* clusters.
-3. **To compare two versions of CacheX, run both back to back, interleaved, in the same sitting** — and treat anything under ~2× on the memory-bound phases as unproven.
-4. This is precisely why Stage 5 needs a better harness. A laptop under an unknown scheduler is not a measurement instrument.
+It also shows the other half of the story: at 1% capacity the cache thrashes
+(193,372 evictions to serve 200,000 requests, 3.3% hit rate). An
+undersized LRU cache is close to pure overhead, which is why capacity is a
+tuning decision and not a formality.
 
 ---
 
-## Reading the results
+## ⚠️ How much to trust the timings
 
-Four observations. All are consequences of the design, and all held in both
-performance clusters — which is why they are worth trusting when the absolute
-numbers are not.
+**Behavioural numbers (hit rate, evictions, fills, checksum) are exact and
+reproducible.** Compare them freely between versions.
 
-1. **`CONTAINS` ≈ `GET miss`** (56 ns vs. 50 ns at the median). Both do one hash
-   and one bucket probe, then stop. This is the cost of the `unordered_map`
-   lookup on its own, and it is the cheapest thing the cache can do.
+**Throughput and latency are not.** Two cautions:
 
-2. **`GET hit` costs ~6× `CONTAINS`** (331 ns vs. 56 ns), despite performing the
-   identical lookup. The difference is the two things a hit does and a
-   `contains` does not: splice the node to the front of the list, and copy the
-   64-byte value into the returned `std::optional<std::string>` — which
-   heap-allocates, because 64 bytes exceeds small-string capacity. This is the
-   measured price of
-   [returning a copy rather than a reference](../ARCHITECTURE.md#6-ownership-and-lifetime),
-   and it is the first thing to attack in Stage 11.
+1. **Latency percentiles are quantised to the clock's 41 ns tick.** A `p50` of 42 ns means *one tick*, not a 42 ns measurement. The reported p50/p95/p99 are effectively tick counts: 42, 83, 125, 167, 208… are 1, 2, 3, 4, 5 ticks. For operations in this range that is coarse, and finer resolution needs a different technique — Stage 5.
 
-3. **`SET update` costs ~3.5× `SET insert`** (533 ns vs. 150 ns) while doing
-   strictly *less* work — no allocation, no map insertion, no new node. The cause
-   is the access pattern, not the operation: inserts walk keys in order and touch
-   freshly allocated, contiguous memory, while updates walk a shuffled order and
-   chase pointers across 200,000 scattered nodes. Nearly every update is a cache
-   miss. This is the clearest demonstration in the project that **algorithmic
-   complexity is not the whole story** — both paths are O(1).
+2. **Absolute throughput is only comparable within one sitting.** In Stage 2, across 12 runs of an identical binary, the memory-bound phases fell into two clusters ~2× apart and the cause was never established (CPU contention alone did not explain it). The Stage 3 workload numbers are much steadier (2–4% spread) because of the warm-up, but the underlying machine behaviour has not changed.
 
-4. **Nothing here contradicts O(1).** The phases span ~10× in cost, but every bit
-   of that is constant factors: allocation, copying, and memory locality. None of
-   it grows with the number of keys.
+The rule: **compare two versions back to back in the same sitting, and trust
+ratios between phases over absolute throughput.** Section 2 of the harness is
+built to satisfy this — it runs its A/B inside a single process, interleaved and
+order-alternated, rather than against a number recorded on another day.
 
 ---
 
-## Known limitations of this baseline
+## Known limitations
 
-- **Average latency only.** Timing each individual operation would cost a `steady_clock` read (~20–25 ns) per measurement — comparable to the operations themselves — and would distort what it measures. Percentiles need a different technique and arrive in Stage 5.
-- **The measurement environment is not controlled.** See the variance section above. This is the single biggest weakness of the Stage 2 harness.
-- **One thread, one key size, one value size, uniform access.** Real workloads are skewed — a small set of hot keys serving most traffic. Skewed distributions arrive with the LRU work in Stage 3, where hit rate starts to mean something.
-- **No hit-rate measurement.** There is nothing to measure yet: the cache is unbounded, so nothing is ever evicted and a key is present iff it was set.
+- **Average and tick-quantised percentiles only.** No sub-tick resolution. ⬜ Stage 5.
+- **Single-threaded.** No contention, no scaling data. ⬜ Stage 8.
+- **One key size, one value size.** 16-byte keys (small-string, no allocation) and 64-byte values (heap-allocated). Behaviour at other sizes is not characterised.
+- **Memory per entry is not measured.** ARCHITECTURE §6 gives an estimate from the data layout; that is not the same as a measurement. ⬜ Stage 11.
+- **Two synthetic distributions.** 80/20 skew and uniform. Real traffic is Zipfian with a time-varying hot set, and neither of these captures a working set that shifts.
 - **In-process.** No sockets, no protocol parsing, no syscalls. Expect these per-operation costs to be dwarfed by network cost once Stage 6 lands.
