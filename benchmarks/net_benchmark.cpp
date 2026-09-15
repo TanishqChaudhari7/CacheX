@@ -30,7 +30,6 @@ constexpr std::size_t kRequests = 20000;  // per phase, single-client section
 // the same total work and the throughputs are directly comparable.
 constexpr std::size_t kTotalRequests = 32000;
 constexpr int kClientCounts[] = {1, 2, 4, 8, 16};
-// Version A / B / C / D from the benchmark plan.
 constexpr std::size_t kShardCounts[] = {1, 2, 4, 8};
 
 // The in-process runs need far more work than the networked ones: without a
@@ -45,8 +44,7 @@ constexpr std::uint32_t kSeed = 42;  // fixed, so the workload is reproducible
 constexpr std::size_t kValueBytes = 64;
 
 /// A blocking, one-request-at-a-time client -- no pipelining, no concurrency.
-/// That is deliberate: it measures a full round trip per request, which is the
-/// baseline the later stages get compared against.
+/// That is deliberate: it measures a full round trip per request.
 class BenchClient {
  public:
   explicit BenchClient(std::uint16_t port) {
@@ -422,7 +420,7 @@ int main() {
               << "=================\n"
               << kTotalRequests
               << " requests per configuration, split across N clients.\n"
-              << "Version A = 1 shard (one global mutex), B = 2, C = 4, D = 8.\n"
+              << "Shard counts 1, 2, 4 and 8; one shard is a single global mutex.\n"
               << "Clients and server share this machine's "
               << std::thread::hardware_concurrency() << " hardware threads.\n";
 

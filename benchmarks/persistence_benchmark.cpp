@@ -159,16 +159,11 @@ int main() {
             << std::setprecision(1) << snapshot_per_entry << " bytes/entry ("
             << std::setprecision(2) << snapshot_per_entry / static_cast<double>(payload)
             << "x payload)\n"
-            << "  in memory (estimated)        : ~180-200 bytes/entry ("
-            << std::setprecision(1) << 190.0 / static_cast<double>(payload)
-            << "x payload)\n\n"
-            << "  The snapshot is far smaller than the live cache because it\n"
-            << "  stores only the data. The hash map's buckets and nodes, both\n"
-            << "  list pointers, the duplicated key and the allocator's overhead\n"
-            << "  all exist to make lookups O(1) -- none of that is worth writing\n"
-            << "  down, because loading rebuilds it.\n"
-            << "\n  The in-memory figure is an estimate from the data layout, not\n"
-            << "  a measurement -- see ARCHITECTURE.md.\n";
+            << "  in memory                    : see MEMORY PER ENTRY in cachex_bench_suite\n\n"
+            << "  The snapshot stores only keys, values and TTLs. The hash map's\n"
+            << "  buckets and nodes, the list pointers, the duplicated key and\n"
+            << "  allocator overhead exist to make lookups O(1) and are rebuilt\n"
+            << "  on load, so none of them is written to disk.\n";
 
   return 0;
 }

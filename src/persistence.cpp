@@ -215,7 +215,9 @@ PersistenceManager::LoadResult PersistenceManager::load(ShardedCache& cache) con
       result.error = "malformed entry header at record " + std::to_string(i);
       return result;
     }
-    if (key_len > bytes_left() || value_len > bytes_left() - key_len) {
+    // Bounded by the whole file size, which stops a corrupt length reaching
+    // resize() without asking the stream for its position on every record.
+    if (key_len > file_bytes || value_len > file_bytes - key_len) {
       result.error = "length exceeds file size at record " + std::to_string(i);
       return result;
     }

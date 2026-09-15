@@ -24,13 +24,25 @@ fi
 
 mkdir -p "$OUT"
 
+# A busy machine distorts every number. Warn rather than refuse, and the load is
+# recorded in environment.txt either way.
+if [ "$(uname -s)" = "Darwin" ]; then
+  LOAD1=$(sysctl -n vm.loadavg | awk '{print $2}')
+  CORES=$(sysctl -n hw.ncpu)
+  if awk -v l="$LOAD1" -v c="$CORES" 'BEGIN { exit !(l > c / 4) }'; then
+    echo "warning: 1-minute load average is $LOAD1 on $CORES cores; results will be noisy" >&2
+  fi
+fi
+
 # Recorded alongside the numbers, because the numbers mean nothing without it.
 {
   echo "CacheX benchmark environment"
   echo "============================"
   echo "date        : $(date -u '+%Y-%m-%dT%H:%M:%SZ') (UTC)"
   echo "git commit  : $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-  echo "git dirty   : $(test -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" && echo yes || echo no)"
+  # benchmarks/results is excluded: this very file is being written there, so
+  # including it would always report uncommitted changes.
+  echo "git dirty   : $(test -n "$(git -C "$REPO" status --porcelain -- . ':(exclude)benchmarks/results' 2>/dev/null)" && echo yes || echo no)"
   echo "uname       : $(uname -smr)"
   if [ "$(uname -s)" = "Darwin" ]; then
     echo "cpu         : $(sysctl -n machdep.cpu.brand_string)"
@@ -59,7 +71,7 @@ echo "=== net_bench ==="
 echo "=== persist_bench ==="
 "$BIN/cachex_persist_bench" > "$OUT/persist_bench.txt" 2>&1
 
-echo "=== cache_bench (in-process, stages 2-4 baseline) ==="
+echo "=== cache_bench (single-threaded Cache) ==="
 "$BIN/cachex_bench" > "$OUT/cache_bench.txt" 2>&1
 
 echo
