@@ -45,7 +45,9 @@ the handful of things that demonstrate the concepts, and nothing more.
 | Eviction | Fixed capacity with an LRU policy, O(1) per operation | ✅ Stage 3 |
 | Expiry | Per-key TTL, lazy expiration | ✅ Stage 4 |
 | Measurement | Benchmark harness: throughput, average latency, percentiles, hit rate | ✅ Stage 3–4 |
-| Active expiry | Background sweep of expired keys | ⬜ after Stage 8 |
+| Benchmark suite | Standard workloads, three versions, profiling, committed raw results | ✅ Stage 9 |
+| Active expiry | Background sweep of expired keys | ⬜ Stage 10 |
+| Event-loop I/O | Many connections served by a few threads instead of one thread each | ⬜ next — the measured bottleneck |
 | Networking | Single-node TCP server, line-based text protocol | ✅ Stage 5 |
 | Concurrency | Multiple clients served safely and, where possible, in parallel | ✅ Stage 6 |
 | Length-prefixed framing | Keys/values containing whitespace or binary data | ⬜ future |
@@ -69,50 +71,45 @@ good interview answer in its own right — *"here is why I did not build it"*.
 ## 3. High-Level Architecture
 
 ```
-             +--------------------+
-             |   cachex_client    |  ✅ interactive CLI           client_main.cpp
-             +--------------------+
-                      |
-                      |  ✅ TCP, line-based text protocol  (docs/PROTOCOL.md)
-                      v
-             +--------------------+
-             |   Server           |  ✅ socket/bind/listen/accept  server.cpp
-             +--------------------+
-                      |
-                      v
-             +--------------------+
-             |   Connection       |  ✅ recv loop, framing         connection.cpp
-             +--------------------+
-                      |
-                      v
-             +--------------------+
-             |   Command Parser   |  ✅ bytes -> typed Command     protocol.cpp
-             |   + reply format   |
-             +--------------------+
-                      |
-======================|====== the boundary: nothing below knows about sockets
-                      v
-        +-------------------------------------------+
-        |                  Cache                    |  cache.hpp / cache.cpp
-        |   set · set+ttl · get · ttl · erase       |
-        |   contains · size · capacity · evictions  |
-        |   expired_removals                        |
-        +-------------------------------------------+
-             |                            |
-             |  owns                      |  borrows (iterators)
-             v                            v
+   cachex_client / netcat / any TCP client
+                  |
+                  |  TCP, line-based text protocol (docs/PROTOCOL.md)
+                  v
+   +------------------------------------------+
+   |  Server        accept loop, one thread   |  server.cpp
+   +------------------------------------------+
+        |  one worker thread per connection (max 256)
+        v
+   +------------------------------------------+
+   |  Connection    recv loop, LineBuffer     |  connection.cpp, line_buffer.cpp
+   |  parse_command -> execute -> reply_*     |  protocol.cpp, command_handler.cpp
+   +------------------------------------------+
+        |                                  |
+        |  GET SET DELETE EXISTS TTL       |  SAVE / LOAD
+        v                                  v
+===========================================|====== nothing below knows about sockets
+   +--------------------------------+   +----------------------------+
+   |  ShardedCache  (8 by default)  |<--|  PersistenceManager        |
+   |  shard = splitmix(hash(key))%N |   |  export_entries() -> file  |
+   +--------------------------------+   |  file -> set()             |
+        |        |    ...    |          |  PeriodicSaver (optional)  |
+        v        v           v          +----------------------------+
+   +---------+ +---------+ +---------+               |
+   |SyncCache| |SyncCache| |SyncCache|               v
+   | mutex   | | mutex   | | mutex   |      snapshot file on disk
+   | Cache   | | Cache   | | Cache   |      (temp file + atomic rename)
+   +---------+ +---------+ +---------+
+        |
+        v   each Cache:
    +----------------------+   +------------------------------+
    |     RecencyList      |<--|            index_            |
-   |   std::list<Entry>   |   |  unordered_map<              |
-   |                      |   |    string,                   |
-   |  head ......... tail |   |    RecencyList::Iterator>    |
-   |  (MRU)        (LRU)  |   +------------------------------+
-   +----------------------+     "where is this key?"   O(1)
-     "what is oldest?"  O(1)
-             |
-             +--> ✅ LRU eviction: oldest() / pop_oldest()
-             +--> ✅ TTL: Entry::expires_at, checked lazily on access
-             +--> ⬜ active expiry sweep (needs thread safety first, Stage 8)
+   |   std::list<Entry>   |   |  unordered_map<string,       |
+   |  head (MRU) ... tail |   |    RecencyList::Iterator>    |
+   +----------------------+   +------------------------------+
+     LRU eviction at tail       O(1) lookup
+     Entry::expires_at checked lazily on access
+
+   not built yet:  active expiry sweep (Stage 10) · event-loop I/O
 ```
 
 ### How the two structures cooperate
@@ -452,11 +449,11 @@ not adjusted. It measures elapsed time, which is precisely what a TTL is.
 **The cost of that choice, stated honestly:** `steady_clock`'s epoch is
 unspecified — in practice it is usually time since boot. A `steady_clock`
 `time_point` is therefore **meaningless outside the running process** and cannot
-be serialised. ⬜ When persistence arrives in Stage 10, snapshots will have to
-convert each deadline into a *remaining duration* at save time (or into
-wall-clock), and rebuild deadlines on load. That is the right trade — correctness
-while running matters more than convenience while saving — but it is a real
-consequence, not a free lunch.
+be serialised. When persistence arrived in Stage 8 this had to be dealt with:
+snapshots store each entry's *remaining duration* plus a wall-clock timestamp of
+the save, and the loader subtracts the time the file spent on disk (§10.2). That
+is the right trade — correctness while running matters more than convenience
+while saving — but it was a real consequence, not a free lunch.
 
 ### 6.3 Lazy expiration
 
@@ -540,11 +537,12 @@ time, the allocator may not return pages to the OS.
 A sweeper thread is the obvious fix for every limitation above. It is
 deliberately deferred, for reasons in this order:
 
-1. **The cache is not thread-safe yet.** A background thread mutating the map and
-   the list while a caller is holding an iterator into them is a data race and an
-   almost-guaranteed use-after-free. Locking is Stage 8. Adding a thread *now*
-   would mean inventing the concurrency design here, badly, as a side effect of a
-   feature about time — and the resulting bug would look like a TTL bug.
+1. **The cache was not thread-safe when TTL was added.** A background thread
+   mutating the map and the list while a caller held an iterator into them would
+   have been a data race and an almost-guaranteed use-after-free. Adding a thread
+   then would have meant inventing the concurrency design as a side effect of a
+   feature about time. *This blocker is now gone: locking arrived in Stage 6 and
+   sharding in Stage 7.*
 
 2. **It would make the design harder to explain, for no gain yet.** Lazy
    expiration is ~6 lines and the whole mechanism fits in one paragraph. A
@@ -562,9 +560,10 @@ deliberately deferred, for reasons in this order:
    deadlines (a priority queue or a bucketed timer wheel) or a way to sample the
    map cheaply. That is a design decision of its own.
 
-⬜ The plan: **Stage 8 first** (make it thread-safe), then active expiry on top,
-with the sampling rate chosen from measurements of how much expired memory
-actually accumulates under the benchmark workloads.
+Where this stands now: reason 1 is resolved (Stage 6), and reasons 3 and 4 are
+what remain. ⬜ Active expiry is Stage 10: a per-shard sweep under that shard's
+lock, with the sampling rate chosen from measurements of how much expired memory
+actually accumulates under the `ttl-heavy` benchmark workload.
 
 ### 6.6 What Redis Does Differently
 
@@ -830,22 +829,19 @@ would pay a full three-way handshake each time. It ends in one of three ways:
 `QUIT` (acknowledged with `+BYE` *before* the close, so the client never has to
 guess), client disconnect (`recv` → 0), or a framing violation.
 
-**The Stage 5 server serves exactly one client at a time.** `accept()` returns a
-connection, it is served to completion, and only then is the next one accepted. A
-second client's `connect()` succeeds — the kernel completes the handshake — and
-then it waits in the backlog.
+*Historical note — superseded in Stage 6.* **The Stage 5 server served exactly
+one client at a time.** `accept()` returned a connection, it was served to
+completion, and only then was the next one accepted; a second client's
+`connect()` succeeded — the kernel completes the handshake — and then waited in
+the backlog. That was deliberate while the cache was not thread-safe, and the
+single-client network benchmark was recorded then as the baseline for what came
+next.
 
-This is a deliberate limitation, not an oversight: **the cache is not
-thread-safe**, so serving two clients in parallel today would be a data race, not
-a feature. ⬜ Concurrency is Stage 8, and the network benchmark exists now
-precisely so that "single client → multiple clients → concurrent server" can be
-compared against a recorded baseline.
-
-The one concession to threads is `Server::stop()`, an `std::atomic<bool>` the
-accept loop polls so a caller on another thread can shut it down. `accept()`
-blocks indefinitely, which would make the server unstoppable, so the loop waits
-on `poll()` with a 100 ms timeout and re-checks the flag. Exactly one thread ever
-touches the cache.
+**Today** each accepted connection gets its own worker thread and the cache is a
+`ShardedCache`; see §8 and §9. `accept()` still blocks indefinitely, so the
+accept loop still waits on `poll()` with a 100 ms timeout and re-checks the
+`std::atomic<bool>` set by `Server::stop()` — that is what lets another thread
+shut the server down, after which every worker is joined.
 ---
 
 ## 8. Concurrency
@@ -1565,7 +1561,13 @@ into work that has to happen regardless.
 
 ⬜ *Future:* `std::shared_ptr<const std::string>` values would make sharing safe
 and cheap without copying the bytes, at the cost of an atomic refcount — a very
-different trade-off once Stage 8 makes the cache multi-threaded.
+different trade-off now that Stage 6 made the cache multi-threaded.
+
+✅ *Partly addressed in Stage 9:* profiling showed the per-hit allocation behind
+this copy was a real share of the read path, so `get_into(key, buffer)` was added.
+It still copies — so the safety argument above is untouched — but into a
+caller-owned buffer whose capacity is reused, which measured +45% throughput
+(median of 5 runs) on the read-heavy workload.
 
 ### No hidden insertion
 
@@ -1580,13 +1582,32 @@ tests pin this (`get_missing_key_returns_nullopt`,
 
 ## 13. Benchmark Methodology
 
-Source: `benchmarks/cache_benchmark.cpp`. Results: `benchmarks/RESULTS.md`.
+Four benchmark binaries, one capture script:
+
+| Binary | Source | What it measures | Since |
+| --- | --- | --- | --- |
+| `cachex_bench` | `benchmarks/cache_benchmark.cpp` | In-process core operations, LRU cost, workloads, hit-rate curve, TTL cost | Stages 2–4 |
+| `cachex_net_bench` | `benchmarks/net_benchmark.cpp` | Over TCP: PING/GET/SET, 1–16 clients, shard matrix | Stages 5–7 |
+| `cachex_persist_bench` | `benchmarks/persistence_benchmark.cpp` | Snapshot save/load time and size | Stage 8 |
+| `cachex_bench_suite` | `benchmarks/bench_suite.cpp` | 5 workloads × 3 versions × 5 thread counts, memory, `get_into` before/after | Stage 9 |
+
+Shared timing and percentile code lives in `benchmarks/bench_util.hpp`.
 
 ```bash
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCACHEX_BUILD_BENCHMARKS=ON
 cmake --build build/release -j
-./build/release/bin/cachex_bench
+./benchmarks/run_all.sh          # runs all four, 5 suite runs by default via RUNS=5
 ```
+
+`run_all.sh` writes raw output to `benchmarks/results/` together with
+`environment.txt` (machine, OS, compiler, git commit, dirty flag, load average).
+Those files are committed, so every number quoted in this document or in
+`benchmarks/RESULTS.md` can be found in one of them. The per-stage write-ups are
+in `benchmarks/RESULTS.md`; the current, authoritative numbers are in
+**Performance Evaluation** at the end of this document.
+
+The rest of this section describes the in-process harness from Stages 2–4; the
+suite's methodology is under Performance Evaluation → Methodology.
 
 ### What is measured
 
@@ -1642,7 +1663,7 @@ Its methodology, and how it differs:
 `p50` of 42 ns means *one tick*, not a 42 ns measurement. For operations in the
 40–400 ns range this is coarse, and the p50/p95/p99 should be read as tick counts
 rather than fine-grained timings. Getting past this needs a different technique
-(batching identical operations, or hardware counters) — ⬜ Stage 5.
+(batching identical operations, or hardware counters) — ⬜ not yet scheduled.
 
 **Absolute throughput is only comparable within a single sitting.** Across 12
 invocations of an identical Stage 2 binary, the memory-latency-bound phases fell
@@ -1659,9 +1680,10 @@ on another day.
 ### What is deliberately not measured yet
 
 - ~~Memory footprint per entry~~ — ✅ measured in Stage 9: **221 bytes/entry**.
-- **Concurrency scaling.** ⬜ Stage 8.
-- **TTL expiry cost.** ⬜ Stage 4.
-- **Latency below the clock tick.** ⬜ Stage 5, as above.
+- ~~Concurrency scaling~~ — ✅ measured in Stages 6, 7 and 9.
+- ~~TTL expiry cost~~ — ✅ measured in Stage 4 (below) and in the Stage 9 `ttl-heavy` workload.
+- **Latency below the clock tick.** ⬜ Not yet measured; see above.
+- **Cold-cache snapshot load.** ⬜ The persistence benchmark loads a file that was just written, so it never touches the disk.
 
 ### Observations on the TTL measurement (§6 of the harness)
 
@@ -1675,11 +1697,11 @@ on because it is what makes the method credible.
 - **The latency percentiles cannot see this effect at all** — p50 reads 208 ns for both cases, because the 41 ns clock tick is three times larger than the 12 ns difference. The throughput measurement resolves what the percentile table cannot, which is a good illustration of why both are reported.
 - **Walking a cache of entirely expired entries** runs at ~6.3 M ops/sec vs ~9.6 M for live hits. That path is not simply slower: those calls return nothing *and* delete an entry, so it is a different operation, not a penalty on the same one.
 
-### Latest results
+### Stage 3 findings (historical)
 
-Full numbers, hardware, and interpretation: **`benchmarks/RESULTS.md`**.
-
-Headline findings from the Stage 3 run:
+These came from the Stage 3 harness and still hold, but they are no longer the
+latest results — for those see **Performance Evaluation** below and
+`benchmarks/results/`.
 
 - **Hit rate tracks capacity as LRU predicts** on skewed traffic: 3.3% at 1% capacity, 30.9% at 10%, 84.2% at 40%, 100% at full capacity. This is the clearest evidence in the project that eviction is choosing the *right* victims — a random-eviction policy would not produce this curve.
 - **The cost of the capacity check is below the harness's noise floor.** The paired comparison straddles zero. That is the expected result for one predictable branch per insert, and it is explicitly *not* a claim that LRU is free — it means this experiment cannot resolve a cost that small.
@@ -1690,58 +1712,56 @@ Headline findings from the Stage 3 run:
 
 ## 14. Current Components
 
-| Path | Purpose | Status |
-| --- | --- | --- |
-| `CMakeLists.txt` | Language standard, build options, warning flags | ✅ |
-| `include/cachex/cache.hpp` | Public `Cache` API, capacity, eviction, TTL | ✅ |
-| `include/cachex/line_buffer.hpp` | Byte stream → lines. No sockets. | ✅ |
-| `include/cachex/protocol.hpp` | `Command`, parser, reply formatting | ✅ |
-| `include/cachex/socket.hpp` | RAII file-descriptor owner, `send_all` | ✅ |
-| `include/cachex/command_handler.hpp` | `execute(Cache&, Command)` — the bridge | ✅ |
-| `include/cachex/connection.hpp` | One client's read/dispatch/write loop | ✅ |
-| `include/cachex/server.hpp` | Listening socket, accept loop, worker threads | ✅ |
-| `include/cachex/sync_cache.hpp` | Thread-safe wrapper: one mutex around Cache (one shard) | ✅ |
-| `include/cachex/sharded_cache.hpp` | N independently locked shards; same API | ✅ |
-| `include/cachex/persistence.hpp` | Snapshot save/load and the periodic saver | ✅ |
-| `benchmarks/bench_suite.cpp` | The full suite: 5 workloads × 3 versions × 5 thread counts | ✅ |
-| `src/net/` | Implementations of the above | ✅ |
-| `src/server_main.cpp`, `src/client_main.cpp` | `cachex_server`, `cachex_client` | ✅ |
-| `docs/PROTOCOL.md` | The wire protocol specification | ✅ |
-| `include/cachex/recency_list.hpp` | `Entry` and `RecencyList` | ✅ |
-| `src/cache.cpp`, `src/recency_list.cpp` | Implementations | ✅ |
-| `src/main.cpp` | Short in-process demo; ⬜ becomes the server in Stage 6 | ✅ |
-| `tests/cache_test.cpp` | Cache semantics and edge cases | ✅ |
-| `tests/lru_test.cpp` | Capacity, eviction, and recency ordering | ✅ |
-| `tests/ttl_test.cpp` | Expiry, TTL query, and lazy-reclamation behaviour | ✅ |
-| `tests/line_buffer_test.cpp` | Framing: split reads, batched reads, CRLF | ✅ |
-| `tests/protocol_test.cpp` | Parser and reply formatting, no sockets | ✅ |
-| `tests/server_test.cpp` | Integration: a real server over a real socket | ✅ |
-| `tests/concurrency_test.cpp` | Parallel readers/writers, mixed workloads, many clients | ✅ |
-| `tests/sharding_test.cpp` | Shard selection, distribution, capacity split, per-shard LRU | ✅ |
-| `tests/persistence_test.cpp` | Save/load round trips, TTL, malformed files, concurrent saves | ✅ |
-| `tests/recency_list_test.cpp` | Ordering and iterator stability | ✅ |
-| `benchmarks/` | `cachex_bench` + `RESULTS.md`; off by default | ✅ |
-| `docs/` | Longer-form notes | — |
+| Path | Purpose |
+| --- | --- |
+| `CMakeLists.txt` | Language standard, build options, warning flags, `compile_commands.json` link |
+| `include/cachex/recency_list.hpp`, `src/recency_list.cpp` | `Entry` and `RecencyList` — the MRU→LRU order |
+| `include/cachex/cache.hpp`, `src/cache.cpp` | `Cache`: single-threaded engine with capacity, eviction, TTL, `get_into`, `export_entries` |
+| `include/cachex/sync_cache.hpp` | `SyncCache`: one mutex around a `Cache`; also serves as one shard |
+| `include/cachex/sharded_cache.hpp`, `src/sharded_cache.cpp` | `ShardedCache`: N independently locked shards, same API |
+| `include/cachex/persistence.hpp`, `src/persistence.cpp` | `PersistenceManager` (snapshot save/load) and `PeriodicSaver` |
+| `include/cachex/line_buffer.hpp`, `src/net/line_buffer.cpp` | Byte stream → lines. No sockets |
+| `include/cachex/protocol.hpp`, `src/net/protocol.cpp` | `Command`, `parse_command`, `reply_*` formatting |
+| `include/cachex/command_handler.hpp`, `src/net/command_handler.cpp` | `execute(ShardedCache&, Command, PersistenceManager*)` — the bridge |
+| `include/cachex/socket.hpp`, `src/net/socket.cpp` | RAII file-descriptor owner, `send_all`, `connect_to` |
+| `include/cachex/connection.hpp`, `src/net/connection.cpp` | One client's read/dispatch/write loop |
+| `include/cachex/server.hpp`, `src/net/server.cpp` | Listening socket, accept loop, worker threads |
+| `src/server_main.cpp` | `cachex_server`: port, capacity, shards, snapshot path, auto-save interval |
+| `src/client_main.cpp` | `cachex_client`: interactive CLI |
+| `src/main.cpp` | `cachex`: in-process demo of LRU and TTL, no networking |
+| `tests/` | 212 tests across 11 test files, plus `tests/test_framework.hpp` and `tests/test_main.cpp` |
+| `benchmarks/*.cpp`, `benchmarks/bench_util.hpp` | The four benchmark binaries (§13) |
+| `benchmarks/run_all.sh`, `benchmarks/results/` | Capture script and committed raw output |
+| `benchmarks/RESULTS.md` | Per-stage benchmark write-ups |
+| `docs/PROTOCOL.md` | Wire protocol specification |
+| `.vscode/c_cpp_properties.json` | Shared editor config pointing IntelliSense at the compile database |
+
+Tests by file: `cache_test`, `lru_test`, `ttl_test`, `recency_list_test`,
+`line_buffer_test`, `protocol_test`, `server_test`, `concurrency_test`,
+`sharding_test`, `persistence_test`, `version_test`.
 
 ### Build targets
 
 ```
 cachex_warnings  (INTERFACE)  warning flags, carried as a target not global flags
         |
-        +--> cachex_core  (static library)  cache · recency_list · version
-                    |                       KNOWS NOTHING ABOUT SOCKETS
-                    |
-                    +--> cachex_net  (static library)
-                    |        line_buffer · protocol · socket
-                    |        command_handler · connection · server
-                    |             |
-                    |             +--> cachex_server     the TCP server
-                    |             +--> cachex_client     interactive CLI
-                    |             +--> cachex_tests      unit + integration
-                    |             +--> cachex_net_bench  network benchmark (opt-in)
-                    |
-                    +--> cachex        thin main(), in-process demo
-                    +--> cachex_bench  in-process benchmark (opt-in)
+        +--> cachex_core  (static library, links Threads)
+        |        cache · recency_list · sharded_cache · persistence · version
+        |        (sync_cache is header-only)       KNOWS NOTHING ABOUT SOCKETS
+        |        |
+        |        +--> cachex_net  (static library)
+        |        |        line_buffer · protocol · socket
+        |        |        command_handler · connection · server
+        |        |             |
+        |        |             +--> cachex_server         the TCP server
+        |        |             +--> cachex_client         interactive CLI
+        |        |             +--> cachex_tests          unit + integration
+        |        |             +--> cachex_net_bench      network benchmark   (opt-in)
+        |        |
+        |        +--> cachex                in-process demo
+        |        +--> cachex_bench          in-process benchmark (opt-in)
+        |        +--> cachex_persist_bench  snapshot benchmark   (opt-in)
+        |        +--> cachex_bench_suite    full suite           (opt-in)
 ```
 
 **The two libraries are the architectural boundary, expressed in the build
@@ -1773,7 +1793,7 @@ their machine.
 | Coroutines | The one genuine temptation, for async networking. But an explicit `epoll`/`kqueue` loop makes the I/O model *visible*, and being able to explain readiness-based I/O is worth more than hiding it behind `co_await`. |
 | Concepts / ranges | Real improvements to generic code. CacheX has almost no generic code. |
 | `std::format` | Convenience only; library support is still uneven. |
-| Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It does not bite yet, but it will when the protocol parser hands over views into a socket buffer (Stage 7). The fix is a transparent hash functor, not a language upgrade. |
+| Heterogeneous lookup with `string_view` | ⚠️ The one real loss. `unordered_map<string, T>::find(string_view)` needs C++20's transparent hashing; in C++17 a lookup from a `string_view` must construct a temporary `std::string`. It has not bitten yet: the parser does tokenise into views, but each key is copied into a `std::string` in the `Command` before the lookup. Removing that copy would need a transparent hash functor, not a language upgrade. |
 
 ### 15.2 Why CMake
 
@@ -1837,6 +1857,25 @@ Build output is reproducible from the sources, specific to one compiler and one
 machine, goes stale the instant a flag changes, and makes every diff unreadable.
 Commit the inputs, never the outputs.
 
+### 15.8 Why `compile_commands.json` is linked into the source root
+
+CMake writes the compile database into each build directory, where editors do not
+look. Without it the editor's C++ parser guessed a pre-C++17 standard and marked
+every `std::optional` as an error in code that built cleanly. CMake now symlinks
+the last-configured build's database into the source root, and a shared
+`.vscode/c_cpp_properties.json` points at it; other personal editor settings stay
+ignored.
+
+### 15.9 Why raw benchmark output is committed, even though build output is not
+
+It looks like it contradicts §15.7, and the difference is the point: build output
+can be regenerated identically, a benchmark run cannot. Machine load, thermal
+state and scheduling make every run different, so a number quoted in a document
+is only checkable if the run that produced it is kept. `benchmarks/run_all.sh`
+records the environment alongside the output, and all published figures are
+medians of committed runs. Doing this exposed two quoted numbers that had come
+from single, unsaved runs, and a warm-up bug in the suite itself.
+
 ---
 
 ## 16. Interview Questions I Should Be Able To Answer
@@ -1894,7 +1933,7 @@ documented and well understood.
 
 - **Memory overhead is high** — **221 bytes per entry, measured**, for ~80 bytes of payload (2.76×). Two node allocations per entry (list node and map node), plus the key stored twice, plus bucket overhead. Redis avoids much of this with *approximated* LRU: it samples a handful of random keys and evicts the oldest of the sample, which needs no list at all.
 - **Poor cache locality.** Both containers are node-based, so a `get` chases pointers through scattered memory. The benchmark shows this clearly: `SET update` costs ~3.5× `SET insert` despite doing strictly less work, purely because of access patterns.
-- **Every read is a write.** A `get` mutates the list. That is free today and becomes a real problem in Stage 8: readers cannot share a read-lock if they all need to reorder, which is exactly why LRU is hard to make concurrent and why sharding (Stage 9) matters.
+- **Every read is a write.** A `get` mutates the list. Since Stage 6 that is a real cost: readers cannot share a read-lock if they all need to reorder, which is exactly why LRU is hard to make concurrent and why sharding (Stage 7) matters.
 - **O(1) is average, not worst case.** Adversarial keys colliding in one bucket degrade lookups to O(n). CacheX assumes a trusted network.
 - **Exact LRU is scan-hostile.** One pass over a large key space evicts the entire hot set — a known LRU weakness that LRU-K, SLRU, or ARC address.
 
@@ -1943,8 +1982,8 @@ the database. `steady_clock` is monotonic and measures elapsed time, which is wh
 a TTL actually is.
 
 The cost: `steady_clock`'s epoch is unspecified (usually boot), so a deadline is
-meaningless outside the process and cannot be serialised. Stage 10 will have to
-convert deadlines to remaining durations when snapshotting. §6.2.
+meaningless outside the process and cannot be serialised. Stage 8's snapshots
+therefore store remaining durations plus a wall-clock save timestamp. §6.2, §10.2.
 
 ### Why lazy expiration, and what does it cost you?
 
@@ -1961,13 +2000,17 @@ an upper bound on live keys, not a count. §6.4.
 
 ### Why no background cleanup thread?
 
-Order of reasons: (1) the cache is not thread-safe yet, so a sweeper mutating the
-map while a caller holds an iterator is a data race and a use-after-free — and the
-bug would present as a TTL bug. (2) The right sampling policy needs measurements
-that do not exist yet; Redis's "20 keys, repeat while >25% expired" are tuned
-constants, not first principles. (3) Sampling a random key from an
-`unordered_map` is not O(1), so active expiry needs a data structure the cache
-does not currently have. Thread safety first (Stage 8), then active expiry. §6.5.
+When TTL was added there were three reasons, in order: (1) the cache was not
+thread-safe, so a sweeper mutating the map while a caller held an iterator would
+have been a data race and a use-after-free — and the bug would have presented as a
+TTL bug. (2) The right sampling policy needs measurements; Redis's "20 keys,
+repeat while >25% expired" are tuned constants, not first principles.
+(3) Sampling a random key from an `unordered_map` is not O(1), so active expiry
+needs a data structure the cache does not have.
+
+Reason 1 is gone — locking arrived in Stage 6 and sharding in Stage 7, so a sweep
+can now run per shard under that shard's lock. Reasons 2 and 3 remain, which is
+why active expiry is still future work (Stage 10). §6.5.
 
 ### What happens if I `SET` a key that already has a TTL?
 
@@ -2280,7 +2323,7 @@ test that verifies the map and the list still agree on which keys exist.
 
 ## 17. Future Roadmap
 
-**Everything below is ⬜ future work.**
+Stages 1–9 are done; the table keeps them for the record.
 
 | # | Stage | What it adds | Core concepts | Status |
 | --- | --- | --- | --- | --- |
@@ -2288,18 +2331,18 @@ test that verifies the map and the list still agree on which keys exist.
 | 2 | Core cache | `set`/`get`/`erase`/`contains`/`size`, hash map + list | Hash tables, iterator invalidation, ownership | ✅ |
 | 3 | LRU eviction | Capacity limit, O(1) eviction, workload benchmarks | Why O(1) LRU needs both structures; hit rate | ✅ |
 | 4 | TTL | Per-key expiry deadlines, lazy expiration | Lazy vs. active expiry; `steady_clock` vs. `system_clock` | ✅ |
-| 5 | **TCP server + protocol** | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
-| 6 | **Concurrency** | Thread-per-connection, SyncCache, scaling benchmark | Data races, mutexes, contention, why `shared_mutex` disappoints for LRU | ✅ |
-| 9 | **Benchmark suite + profiling** | Standard workloads, full metrics, `sample` profile, a measured optimisation | Measuring before optimising; what not to claim | ✅ |
-| 7 | **Sharded cache** | N independently locked shards, A/B/C/D benchmark matrix | Lock contention; when optimising the wrong thing changes nothing | ✅ |
-| 10 | Active expiry | Background sweep, once locking exists | Sampling policies; why it cannot come before thread safety | ⬜ |
-| 8 | **Persistence** | Snapshot to disk, restore on startup, SAVE/LOAD | Serialisation; atomic replace; what a cache is *not* | ✅ |
-| 11 | Final optimisation | Profile, tune, re-benchmark against the recorded baselines | Cache locality, allocation cost, proving an improvement | ⬜ |
+| 5 | TCP server + protocol | `socket`/`bind`/`listen`/`accept`, line protocol, CLI client, network benchmark | The socket API; framing; partial reads and writes | ✅ |
+| 6 | Concurrency | Thread-per-connection, `SyncCache`, scaling benchmark | Data races, mutexes, contention, why `shared_mutex` disappoints for LRU | ✅ |
+| 7 | Sharded cache | N independently locked shards, A/B/C/D benchmark matrix | Lock contention; when optimising the wrong thing changes nothing | ✅ |
+| 8 | Persistence | Snapshot to disk, restore on startup, `SAVE`/`LOAD` | Serialisation; atomic replace; what a cache is *not* | ✅ |
+| 9 | Benchmark suite + profiling | Standard workloads, full metrics, `sample` profile, `get_into` (+45%), committed results | Measuring before optimising; what not to claim | ✅ |
+| — | Event-loop I/O | `kqueue`/`epoll` loop serving many connections from a few threads | Readiness-based I/O; why thread-per-connection stops scaling | ⬜ next — over TCP the transport, not the cache, is the measured limit |
+| 10 | Active expiry | Per-shard background sweep | Sampling policies; bounding sweep cost under a shard lock | ⬜ |
+| 11 | Further optimisation | Remove the duplicated key, reduce the 221 bytes/entry, re-benchmark against committed results | Cache locality, allocation cost, proving an improvement | ⬜ |
 
-Stage numbering note: active expiry sits after concurrency and sharding because
-it cannot safely precede thread safety (§6.5). Earlier documents referred to
-concurrency as "Stage 7" or "Stage 8"; the ordering is what matters, not the
-number.
+Stage numbers were renumbered as the plan changed; earlier write-ups in
+`benchmarks/RESULTS.md` sometimes refer to concurrency as "Stage 7" or "Stage 8".
+The ordering is what matters, not the number.
 
 Each stage ends with this document updated: components in §14, decisions in §15,
 new questions in §16, and the diagram in §3 grown to match what actually exists.
@@ -2428,7 +2471,7 @@ The system-level reason threads exist at all is not cache throughput — it is t
 a server must serve many connections, and Stage 5 measured that a TCP round trip
 (~20 µs) dwarfs a cache operation (~0.4 µs). Over TCP the cache is ~2% of a
 request, which is why the networked benchmark shows sharding moving throughput by
-≤0.8% (§10 of `benchmarks/RESULTS.md`).
+≤0.8% (Stage 7 section of `benchmarks/RESULTS.md`).
 
 ## Memory
 
