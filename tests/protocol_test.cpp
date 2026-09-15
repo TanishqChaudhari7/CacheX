@@ -1,9 +1,15 @@
 #include "cachex/protocol.hpp"
 
+#include <unistd.h>
+
+#include <cstdio>
+
 #include <string>
 
 #include "cachex/sharded_cache.hpp"
 #include "cachex/command_handler.hpp"
+#include "cachex/persistence.hpp"
+#include "cachex/socket.hpp"
 #include "test_framework.hpp"
 
 namespace {
@@ -235,3 +241,67 @@ CACHEX_TEST(a_plain_set_clears_an_existing_ttl_over_the_wire_too) {
   run("SET k v");
   CHECK_EQ(run("TTL k"), "+NOEXPIRE\n");
 }
+
+// --- SAVE / LOAD through the command handler -------------------------------
+
+CACHEX_TEST(save_and_load_report_entry_counts) {
+  const std::string path = "/tmp/cachex_protocol_save_" + std::to_string(::getpid()) + ".cxs";
+  std::remove(path.c_str());
+  cachex::PersistenceManager persistence(path);
+
+  cachex::ShardedCache source{2};
+  source.set("a", "1");
+  source.set("b", "2");
+  const auto save = cachex::parse_command("SAVE");
+  CHECK(save.ok);
+  CHECK_EQ(cachex::execute(source, save.command, &persistence), ":2\n");
+
+  cachex::ShardedCache target{2};
+  const auto load = cachex::parse_command("LOAD");
+  CHECK(load.ok);
+  CHECK_EQ(cachex::execute(target, load.command, &persistence), ":2\n");
+  CHECK_EQ(target.get("b").value_or(""), "2");
+
+  std::remove(path.c_str());
+}
+
+CACHEX_TEST(save_and_load_without_persistence_are_errors_not_crashes) {
+  cachex::ShardedCache cache{1};
+  const auto save = cachex::parse_command("SAVE");
+  const auto load = cachex::parse_command("LOAD");
+  CHECK_EQ(cachex::execute(cache, save.command, nullptr),
+           "-ERR persistence is not enabled on this server\n");
+  CHECK_EQ(cachex::execute(cache, load.command, nullptr),
+           "-ERR persistence is not enabled on this server\n");
+}
+
+CACHEX_TEST(save_and_load_take_no_arguments) {
+  // A path from the network would let any client read or overwrite any file.
+  CHECK(!cachex::parse_command("SAVE /etc/passwd").ok);
+  CHECK(!cachex::parse_command("LOAD ../../x").ok);
+}
+
+// --- port parsing ----------------------------------------------------------
+
+CACHEX_TEST(parse_port_accepts_the_full_valid_range) {
+  std::uint16_t port = 1;
+  CHECK(cachex::parse_port("0", port));
+  CHECK_EQ(port, 0);
+  CHECK(cachex::parse_port("6379", port));
+  CHECK_EQ(port, 6379);
+  CHECK(cachex::parse_port("65535", port));
+  CHECK_EQ(port, 65535);
+}
+
+CACHEX_TEST(parse_port_rejects_what_stoi_would_silently_mangle) {
+  std::uint16_t port = 1234;
+  CHECK(!cachex::parse_port("", port));
+  CHECK(!cachex::parse_port("65536", port));   // stoi + cast: wraps to 0
+  CHECK(!cachex::parse_port("70000", port));   // stoi + cast: wraps to 4464
+  CHECK(!cachex::parse_port("-1", port));      // stoi + cast: becomes 65535
+  CHECK(!cachex::parse_port("123abc", port));  // stoi: accepts 123
+  CHECK(!cachex::parse_port(" 80", port));
+  CHECK(!cachex::parse_port("+80", port));
+  CHECK_EQ(port, 1234);  // untouched on failure
+}
+

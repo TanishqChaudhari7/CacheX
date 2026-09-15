@@ -300,8 +300,8 @@ CACHEX_TEST(set_accepts_temporaries_and_moved_from_arguments) {
 // --- recency ordering ------------------------------------------------------
 //
 // Nothing is evicted yet, so ordering is not externally observable through
-// get/set. These tests pin the invariant now so that Stage 3 eviction starts
-// from a known-correct order.
+// get/set. These tests pin the invariant directly, because eviction is only
+// correct if this order is.
 
 CACHEX_TEST(newest_insert_goes_to_the_front) {
   cachex::Cache cache;

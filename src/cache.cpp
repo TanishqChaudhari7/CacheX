@@ -10,7 +10,7 @@ namespace {
 /// The short-circuit matters: an entry with no deadline never reads the clock.
 /// steady_clock::now() costs roughly as much as the hash lookup itself, so
 /// checking `has_value()` first is what keeps TTL close to free for the keys
-/// that do not use it. Benchmarked in ARCHITECTURE.md §13.
+/// that do not use it. Measured in ARCHITECTURE.md §14.
 bool is_expired(const Entry& entry) {
   return entry.expires_at.has_value() && *entry.expires_at <= Entry::Clock::now();
 }
@@ -47,7 +47,7 @@ void Cache::store(std::string key, std::string value,
     entries_.mark_used(it->second);
     // An update cannot exceed capacity: the entry count is unchanged. Writing to
     // a key counts as using it, so the entry moves to the front -- see the
-    // recency-semantics note in ARCHITECTURE.md §4.6.
+    // recency rules in ARCHITECTURE.md §6.
     return;
   }
 
@@ -90,37 +90,39 @@ void Cache::evict_oldest() {
   ++evictions_;
 }
 
-std::optional<std::string> Cache::get(const std::string& key) {
+Cache::Index::iterator Cache::find_live(const std::string& key) {
   const auto it = index_.find(key);
   if (it == index_.end()) {
-    return std::nullopt;
+    return it;
   }
 
   // Lazy expiration: an expired entry is indistinguishable from an absent one to
   // the caller, and this is the moment we happen to be holding it, so reclaim it
-  // now rather than leaving it to a sweep that does not exist yet.
+  // now. There is no background sweep (ARCHITECTURE.md §7).
   if (is_expired(*it->second)) {
     remove(it);
     ++expired_removals_;
+    return index_.end();
+  }
+  return it;
+}
+
+std::optional<std::string> Cache::get(const std::string& key) {
+  const auto it = find_live(key);
+  if (it == index_.end()) {
     return std::nullopt;
   }
-
   entries_.mark_used(it->second);
 
   // A copy, not a reference. A reference would dangle the moment the caller made
-  // another call that erased or evicted this entry -- and now that eviction
-  // exists, *any* set() on a full cache can be that call.
+  // another call that erased or evicted this entry -- and on a full cache *any*
+  // set() can be that call.
   return it->second->value;
 }
 
 bool Cache::get_into(const std::string& key, std::string& out) {
-  const auto it = index_.find(key);
+  const auto it = find_live(key);
   if (it == index_.end()) {
-    return false;
-  }
-  if (is_expired(*it->second)) {
-    remove(it);
-    ++expired_removals_;
     return false;
   }
   entries_.mark_used(it->second);
@@ -190,7 +192,7 @@ std::vector<EntrySnapshot> Cache::export_entries() const {
   const Clock::time_point now = Clock::now();
 
   // Front to back, so the result is most-recently-used first. The loader replays
-  // it in reverse, which reconstructs the same recency order in the new process.
+  // it in reverse, which reconstructs the same recency order on load.
   for (const Entry& entry : entries_) {
     if (!entry.expires_at.has_value()) {
       out.push_back(EntrySnapshot{entry.key, entry.value, std::nullopt});

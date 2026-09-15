@@ -12,110 +12,10 @@
 #include "cachex/protocol.hpp"
 #include "cachex/socket.hpp"
 #include "test_framework.hpp"
+#include "test_support.hpp"
 
-namespace {
-
-/// Runs a real Server on a real socket, on an OS-assigned port.
-///
-/// Port 0 matters: a hard-coded port would collide with a developer's running
-/// server, with a second copy of the suite, and with itself if a previous run's
-/// socket were still in TIME_WAIT. The kernel hands out a free one instead.
-class ServerFixture {
- public:
-  ServerFixture() : server_(cache_, options()) {
-    std::string error;
-    started_ = server_.start(error);
-    if (started_) {
-      thread_ = std::thread([this] { server_.run(); });
-    }
-  }
-
-  ~ServerFixture() {
-    server_.stop();
-    if (thread_.joinable()) {
-      thread_.join();
-    }
-  }
-
-  ServerFixture(const ServerFixture&) = delete;
-  ServerFixture& operator=(const ServerFixture&) = delete;
-
-  bool started() const { return started_; }
-  std::uint16_t port() const { return server_.bound_port(); }
-  cachex::ShardedCache& cache() { return cache_; }
-  const cachex::Server& server() const { return server_; }
-
- private:
-  static cachex::Server::Options options() {
-    cachex::Server::Options opts;
-    opts.port = 0;         // let the OS choose
-    opts.verbose = false;  // keep the test output readable
-    return opts;
-  }
-
-  cachex::ShardedCache cache_{1};
-  cachex::Server server_;
-  std::thread thread_;
-  bool started_ = false;
-};
-
-/// A minimal client. Destroying it closes the connection, which is what lets
-/// the single-threaded server move on to the next test's client.
-class TestClient {
- public:
-  explicit TestClient(std::uint16_t port) {
-    std::string error;
-    socket_ = cachex::connect_to("127.0.0.1", port, error);
-    if (socket_.valid()) {
-      // Without a receive timeout, a server bug becomes a hung test suite
-      // rather than a failing one. Five seconds is far longer than any
-      // legitimate local round trip.
-      timeval timeout{};
-      timeout.tv_sec = 5;
-      ::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout));
-    }
-  }
-
-  bool connected() const { return socket_.valid(); }
-
-  bool send_raw(const std::string& data) {
-    return cachex::send_all(socket_.get(), data);
-  }
-
-  /// Reads one reply line, buffering across recv() calls exactly as the real
-  /// client does. Returns nullopt if the server closed or timed out.
-  std::optional<std::string> read_reply() {
-    while (true) {
-      if (std::optional<std::string> line = replies_.next_line()) {
-        return line;
-      }
-      char chunk[4096];
-      const ssize_t received = ::recv(socket_.get(), chunk, sizeof(chunk), 0);
-      if (received <= 0) {
-        return std::nullopt;
-      }
-      replies_.append(chunk, static_cast<std::size_t>(received));
-    }
-  }
-
-  /// Sends one command and returns the reply, or "<no reply>" on failure --
-  /// a sentinel rather than a crash, so a failing CHECK_EQ shows what happened.
-  std::string request(const std::string& command) {
-    if (!send_raw(command + "\n")) {
-      return "<send failed>";
-    }
-    return read_reply().value_or("<no reply>");
-  }
-
-  void disconnect() { socket_.close(); }
-
- private:
-  cachex::Socket socket_;
-  cachex::LineBuffer replies_;
-};
-
-}  // namespace
+using cachex::testing::ServerFixture;
+using cachex::testing::TestClient;
 
 CACHEX_TEST(server_binds_an_ephemeral_port_and_accepts_a_connection) {
   ServerFixture fixture;
@@ -348,3 +248,31 @@ CACHEX_TEST(the_server_state_is_the_cache_the_caller_owns) {
   client.request("SET from_network 1");
   CHECK(fixture.cache().contains("from_network"));
 }
+
+CACHEX_TEST(a_client_beyond_the_connection_limit_is_told_and_disconnected) {
+  ServerFixture fixture(/*max_connections=*/1);
+  CHECK(fixture.started());
+
+  TestClient first(fixture.port());
+  CHECK_EQ(first.request("PING"), "+PONG");  // the one allowed connection
+
+  TestClient second(fixture.port());
+  CHECK_EQ(second.read_reply().value_or("<none>"), "-ERR server at connection limit (1)");
+  CHECK(!second.read_reply().has_value());  // and then closed
+
+  CHECK_EQ(first.request("PING"), "+PONG");  // the admitted client is unaffected
+
+  // Once the first client leaves, its slot is released for someone else. The
+  // worker notices the disconnect asynchronously, so allow it a moment.
+  first.disconnect();
+  bool admitted = false;
+  for (int attempt = 0; attempt < 100 && !admitted; ++attempt) {
+    TestClient retry(fixture.port());
+    admitted = retry.request("PING") == "+PONG";
+    if (!admitted) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
+  CHECK(admitted);
+}
+

@@ -12,15 +12,11 @@ namespace {
 
 using bench::Clock;
 using bench::Nanos;
+using bench::pad_key;
 
 constexpr std::size_t kKeyBytes = 16;
 constexpr std::size_t kValueBytes = 64;
 constexpr int kRepeats = 5;
-
-std::string pad_key(std::size_t i) {
-  const std::string digits = std::to_string(i);
-  return "key:" + std::string(12 - digits.size(), '0') + digits;
-}
 
 /// A snapshot path that removes itself.
 class TempFile {

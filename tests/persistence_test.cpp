@@ -468,3 +468,80 @@ CACHEX_TEST(the_periodic_saver_can_be_stopped_twice_safely) {
   saver.stop();  // idempotent; the destructor calls it a third time
   CHECK_EQ(saver.save_failures(), 0u);
 }
+
+// --- untrusted sizes -------------------------------------------------------
+
+// Counts and lengths come from disk. A corrupt value must be reported as a bad
+// file, not passed to reserve() or resize() where it would throw bad_alloc and
+// take the server down on startup or on LOAD.
+CACHEX_TEST(an_impossible_entry_count_is_rejected_without_crashing) {
+  const TempSnapshot temp("hugecount");
+  temp.write_raw("CACHEX-SNAPSHOT 1 0\n999999999999999999\n");
+
+  cachex::ShardedCache cache(2);
+  const auto loaded = cachex::PersistenceManager(temp.path()).load(cache);
+  CHECK(!loaded.ok);
+  CHECK(loaded.error.find("exceeds") != std::string::npos);
+  CHECK_EQ(cache.size(), 0u);
+}
+
+CACHEX_TEST(an_impossible_record_length_is_rejected_without_crashing) {
+  const TempSnapshot temp("hugelength");
+  temp.write_raw("CACHEX-SNAPSHOT 1 0\n1\n999999999999 1 -1\nab\n");
+
+  cachex::ShardedCache cache(2);
+  const auto loaded = cachex::PersistenceManager(temp.path()).load(cache);
+  CHECK(!loaded.ok);
+  CHECK(loaded.error.find("exceeds") != std::string::npos);
+  CHECK_EQ(cache.size(), 0u);
+}
+
+// The bug this pins: every save used to write the same temp file, so two saves
+// at once could interleave their bytes and rename a corrupt snapshot into place.
+// A reader loading continuously while several threads save through one manager
+// must never see a file that fails to parse.
+CACHEX_TEST(concurrent_saves_through_one_manager_never_expose_a_corrupt_snapshot) {
+  const TempSnapshot temp("shared_manager");
+  cachex::ShardedCache cache(4);
+  for (int i = 0; i < 300; ++i) {
+    cache.set("stable" + std::to_string(i), std::string(200, 'x'));
+  }
+  const cachex::PersistenceManager manager(temp.path());
+  CHECK(manager.save(cache).ok);  // so the reader never sees "missing"
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> failed_saves{0};
+  std::atomic<int> failed_loads{0};
+  std::atomic<int> loads{0};
+
+  std::thread reader([&] {
+    while (!stop.load()) {
+      cachex::ShardedCache restored(4);
+      if (!manager.load(restored).ok || restored.size() != 300u) {
+        failed_loads.fetch_add(1);
+      }
+      loads.fetch_add(1);
+    }
+  });
+
+  std::vector<std::thread> savers;
+  for (int s = 0; s < 6; ++s) {
+    savers.emplace_back([&] {
+      for (int i = 0; i < 20; ++i) {
+        if (!manager.save(cache).ok) {
+          failed_saves.fetch_add(1);
+        }
+      }
+    });
+  }
+  for (std::thread& saver : savers) {
+    saver.join();
+  }
+  stop.store(true);
+  reader.join();
+
+  CHECK_EQ(failed_saves.load(), 0);
+  CHECK_EQ(failed_loads.load(), 0);
+  CHECK(loads.load() > 0);
+}
+

@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -28,7 +27,6 @@
 
 #include "bench_util.hpp"
 #include "cachex/cache.hpp"
-#include "cachex/persistence.hpp"
 #include "cachex/sharded_cache.hpp"
 #include "cachex/sync_cache.hpp"
 
@@ -42,6 +40,7 @@ namespace {
 
 using bench::Clock;
 using bench::Nanos;
+using bench::StartGate;
 
 constexpr std::uint32_t kSeed = 20260911;
 constexpr std::size_t kOpsPerWorkload = 400000;
@@ -158,40 +157,6 @@ struct Metrics {
                     : 0.0;
   }
   double miss_ratio() const { return hits + misses > 0 ? 100.0 - hit_ratio() : 0.0; }
-};
-
-/// Releases every worker at the same instant, so an N-thread run really has N
-/// threads in flight rather than a staggered ramp.
-class StartGate {
- public:
-  explicit StartGate(int participants) : remaining_(participants) {}
-
-  void arrive_and_wait() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (--remaining_ == 0) {
-      ready_.notify_all();
-    }
-    ready_.wait(lock, [this] { return remaining_ == 0; });
-    go_.wait(lock, [this] { return released_; });
-  }
-  void wait_until_all_ready() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    ready_.wait(lock, [this] { return remaining_ == 0; });
-  }
-  void release() {
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      released_ = true;
-    }
-    go_.notify_all();
-  }
-
- private:
-  std::mutex mutex_;
-  std::condition_variable ready_;
-  std::condition_variable go_;
-  int remaining_;
-  bool released_ = false;
 };
 
 std::uint64_t g_sink = 0;
@@ -373,8 +338,7 @@ int main() {
   std::vector<std::string> keys;
   keys.reserve(widest_key_space);
   for (std::size_t i = 0; i < widest_key_space; ++i) {
-    const std::string digits = std::to_string(i);
-    keys.push_back("key:" + std::string(12 - digits.size(), '0') + digits);
+        keys.push_back(bench::pad_key(i));
   }
   const std::string value(kValueBytes, 'v');
 
@@ -585,8 +549,7 @@ int main() {
     {
       auto cache = std::make_unique<cachex::Cache>();
       for (std::size_t i = 0; i < entries; ++i) {
-        const std::string digits = std::to_string(i);
-        cache->set("key:" + std::string(12 - digits.size(), '0') + digits, value);
+                cache->set(bench::pad_key(i), value);
       }
       const std::size_t after = heap_bytes_in_use();
       const double delta = static_cast<double>(after) - static_cast<double>(before);

@@ -3,9 +3,8 @@
 A line-based text protocol over TCP. Deliberately not RESP — the goal here is a
 protocol you can drive with `netcat` and read with your eyes.
 
-> **Status:** ✅ implemented in Stage 5. This document is the specification; the
-> parser in `src/net/protocol.cpp` is the implementation, and
-> `tests/protocol_test.cpp` is the executable version of this page.
+> The parser in `src/net/protocol.cpp` implements this document, and
+> `tests/protocol_test.cpp` checks it.
 
 ---
 
@@ -168,13 +167,17 @@ connection and carries on. It does not die of `SIGPIPE`, which is suppressed via
 
 ## 8. Concurrency
 
-**The Stage 5 server serves exactly one client at a time.** A second client
-completes its TCP handshake — the kernel does that independently — and then waits
-in the accept backlog (128 deep) until the first client disconnects.
+Each connection is served by its own server thread, so many clients can be
+connected and issuing commands at once. The protocol itself has no notion of
+concurrency: every reply on a connection answers the request before it, in order.
 
-This is a real limitation, not an oversight: the cache is not thread-safe, so
-serving two clients in parallel today would be a data race. Concurrency is
-Stage 8.
+- Commands from different connections run in parallel. Each `GET`, `SET`,
+  `DELETE`, `EXISTS` and `TTL` locks only the one shard its key belongs to.
+- There are no multi-command transactions. A client that does `GET` then `SET`
+  can have another client's write land in between.
+- The server accepts up to 256 simultaneous connections by default. A client
+  connecting beyond that receives `-ERR server at connection limit (256)` and is
+  disconnected.
 
 ## 9. Worked example
 

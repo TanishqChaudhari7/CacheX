@@ -5,11 +5,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -164,5 +166,55 @@ inline std::vector<Request> make_workload(std::size_t ops, std::size_t key_space
   return requests;
 }
 
+/// A zero-padded key such as "key:000000000042": always 16 bytes with the
+/// default prefix. Constant length keeps hashing cost from drifting during a
+/// run, and 16 bytes fits small-string storage, so building or comparing a key
+/// costs no allocation.
+inline std::string pad_key(std::size_t i, const char* prefix = "key:") {
+  const std::string digits = std::to_string(i);
+  return prefix + std::string(12 - digits.size(), '0') + digits;
+}
+
+/// Releases every worker thread at the same instant.
+///
+/// Without it the first thread would start, and perhaps finish, while the last
+/// was still setting up, so an "N thread" run would spend part of its time with
+/// fewer than N in flight -- understating contention exactly where the
+/// benchmark is trying to measure it.
+class StartGate {
+ public:
+  explicit StartGate(int participants) : remaining_(participants) {}
+
+  /// Called by each worker once it is ready; returns when release() is called.
+  void arrive_and_wait() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (--remaining_ == 0) {
+      ready_.notify_all();
+    }
+    ready_.wait(lock, [this] { return remaining_ == 0; });
+    go_.wait(lock, [this] { return released_; });
+  }
+
+  /// Blocks until every worker has arrived.
+  void wait_until_all_ready() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ready_.wait(lock, [this] { return remaining_ == 0; });
+  }
+
+  void release() {
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      released_ = true;
+    }
+    go_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::condition_variable go_;
+  int remaining_;
+  bool released_ = false;
+};
 
 }  // namespace bench

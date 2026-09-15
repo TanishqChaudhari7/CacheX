@@ -7,20 +7,11 @@
 #include <vector>
 
 #include "test_framework.hpp"
+#include "test_support.hpp"
+
+using cachex::testing::run_parallel;
 
 namespace {
-
-template <typename F>
-void run_parallel(int count, F worker) {
-  std::vector<std::thread> threads;
-  threads.reserve(static_cast<std::size_t>(count));
-  for (int i = 0; i < count; ++i) {
-    threads.emplace_back([&worker, i] { worker(i); });
-  }
-  for (std::thread& thread : threads) {
-    thread.join();
-  }
-}
 
 /// Sums one shard's recency list, for invariant checks.
 std::size_t resident_in_shard(const cachex::ShardedCache& cache,

@@ -22,7 +22,7 @@ namespace cachex {
 /// of the recency list and may reclaim an expired one, so two concurrent "reads"
 /// would be two concurrent list mutations. A std::shared_mutex would therefore
 /// let almost nothing actually share -- reads are the common case in a cache,
-/// and reads are writes here. See ARCHITECTURE §8.
+/// and reads are writes here. See ARCHITECTURE.md §10.
 ///
 /// The type is the safety mechanism: Server and Connection take a SyncCache&,
 /// so it is not possible to hand the server an unsynchronised Cache by mistake.

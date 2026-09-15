@@ -1,3 +1,4 @@
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -7,6 +8,7 @@
 #include "cachex/persistence.hpp"
 #include "cachex/sharded_cache.hpp"
 #include "cachex/server.hpp"
+#include "cachex/socket.hpp"
 #include "cachex/version.hpp"
 
 namespace {
@@ -32,6 +34,15 @@ void usage(const char* program) {
             << "  save-secs  auto-save interval in seconds, 0 to disable\n";
 }
 
+/// Digits only, nothing trailing. std::stoull would accept "-1" and wrap it to
+/// the largest possible value.
+bool parse_count(const char* text, std::size_t& out) {
+  const std::string_view view(text);
+  const char* const end = view.data() + view.size();
+  const std::from_chars_result parsed = std::from_chars(view.data(), end, out);
+  return !view.empty() && parsed.ec == std::errc() && parsed.ptr == end;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -39,31 +50,22 @@ int main(int argc, char** argv) {
   std::size_t capacity = 0;
   std::size_t shards = 8;
   std::string snapshot_path;
-  int save_interval = 0;
+  std::size_t save_interval = 0;
 
   if (argc > 6) {
     usage(argv[0]);
     return 2;
   }
-  try {
-    if (argc >= 2) {
-      port = static_cast<std::uint16_t>(std::stoi(argv[1]));
-    }
-    if (argc >= 3) {
-      capacity = static_cast<std::size_t>(std::stoull(argv[2]));
-    }
-    if (argc >= 4) {
-      shards = static_cast<std::size_t>(std::stoull(argv[3]));
-    }
-    if (argc >= 5) {
-      snapshot_path = argv[4];
-    }
-    if (argc >= 6) {
-      save_interval = std::stoi(argv[5]);
-    }
-  } catch (const std::exception&) {
+  const bool valid = (argc < 2 || cachex::parse_port(argv[1], port)) &&
+                     (argc < 3 || parse_count(argv[2], capacity)) &&
+                     (argc < 4 || parse_count(argv[3], shards)) &&
+                     (argc < 6 || parse_count(argv[5], save_interval));
+  if (!valid) {
     usage(argv[0]);
     return 2;
+  }
+  if (argc >= 5) {
+    snapshot_path = argv[4];
   }
 
   // unique_ptr because ShardedCache owns mutexes and so is neither copyable nor
@@ -131,7 +133,8 @@ int main(int argc, char** argv) {
   std::unique_ptr<cachex::PeriodicSaver> saver;
   if (persistence && save_interval > 0) {
     saver = std::make_unique<cachex::PeriodicSaver>(
-        *persistence, *cache, std::chrono::seconds(save_interval));
+        *persistence, *cache,
+        std::chrono::seconds(static_cast<long long>(save_interval)));
   }
 
   server.run();

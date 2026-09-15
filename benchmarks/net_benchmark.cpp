@@ -1,11 +1,11 @@
 #include <sys/socket.h>
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,7 +13,6 @@
 
 #include "bench_util.hpp"
 #include "cachex/sharded_cache.hpp"
-#include <iterator>
 #include "cachex/line_buffer.hpp"
 #include "cachex/server.hpp"
 #include "cachex/socket.hpp"
@@ -22,6 +21,8 @@ namespace {
 
 using bench::Clock;
 using bench::Nanos;
+using bench::pad_key;
+using bench::StartGate;
 
 constexpr std::size_t kRequests = 20000;  // per phase, single-client section
 
@@ -81,48 +82,6 @@ class BenchClient {
  private:
   cachex::Socket socket_;
   cachex::LineBuffer replies_;
-};
-
-/// Releases every client thread at the same instant.
-///
-/// Without this the first client would start (and finish) while the last was
-/// still opening its socket, so a "16 client" run would spend part of its time
-/// with far fewer than 16 clients actually in flight -- and would understate
-/// contention exactly where the benchmark is trying to measure it.
-class StartGate {
- public:
-  explicit StartGate(int participants) : remaining_(participants) {}
-
-  /// Called by each worker once it is connected and ready.
-  void arrive_and_wait() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (--remaining_ == 0) {
-      ready_.notify_all();
-    }
-    ready_.wait(lock, [this] { return remaining_ == 0; });
-    go_.wait(lock, [this] { return released_; });
-  }
-
-  /// Blocks until every worker has arrived.
-  void wait_until_all_ready() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    ready_.wait(lock, [this] { return remaining_ == 0; });
-  }
-
-  void release() {
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      released_ = true;
-    }
-    go_.notify_all();
-  }
-
- private:
-  std::mutex mutex_;
-  std::condition_variable ready_;
-  std::condition_variable go_;
-  int remaining_;
-  bool released_ = false;
 };
 
 struct ConcurrentResult {
@@ -232,11 +191,6 @@ void print_phase(const char* name, const PhaseResult& result) {
             << result.latency.p95 / 1000.0 << std::setw(11)
             << result.latency.p99 / 1000.0 << std::setw(12)
             << result.latency.max / 1000.0 << "\n";
-}
-
-std::string pad_key(std::size_t i) {
-  const std::string digits = std::to_string(i);
-  return "key:" + std::string(12 - digits.size(), '0') + digits;
 }
 
 }  // namespace

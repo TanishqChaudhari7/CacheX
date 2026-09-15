@@ -46,10 +46,11 @@ class PersistenceManager {
 
   /// Writes every live entry to the snapshot file.
   ///
-  /// The write goes to `path + ".tmp"` and is then renamed into place. rename()
-  /// is atomic on POSIX, so an interrupted save leaves either the previous
-  /// snapshot or the new one -- never a half-written file that would fail to
-  /// load. Writing in place would risk exactly that.
+  /// The write goes to a uniquely named temp file next to the snapshot and is
+  /// then renamed into place. rename() is atomic on POSIX, so an interrupted save
+  /// leaves either the previous snapshot or the new one -- never a half-written
+  /// file. Because every save has its own temp file, concurrent saves are safe:
+  /// each produces a complete file and the last rename wins.
   SaveResult save(const ShardedCache& cache) const;
 
   /// Replaces nothing; adds the snapshot's entries to `cache` via set().
@@ -77,8 +78,9 @@ class PersistenceManager {
 /// destructor, never detached -- a detached saver could outlive the cache it
 /// holds a reference to.
 ///
-/// Nothing here needs extra locking: it calls the same public save() a client's
-/// SAVE command would, and the cache does its own synchronisation.
+/// It calls the same save() a client's SAVE command does. Running at the same
+/// time as one is safe: the cache synchronises itself, and every save writes its
+/// own temp file.
 class PeriodicSaver {
  public:
   PeriodicSaver(PersistenceManager& manager, ShardedCache& cache,

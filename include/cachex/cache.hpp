@@ -37,7 +37,7 @@ struct TtlInfo {
 /// internally. That is forced by the clock choice: steady_clock's epoch is
 /// unspecified (in practice, boot time), so a deadline from one process is
 /// meaningless in the next one. Converting to "time left" at export is the price
-/// of using a monotonic clock, and it was flagged as future work back in §6.2.
+/// of using a monotonic clock (ARCHITECTURE.md §7, §12).
 struct EntrySnapshot {
   std::string key;
   std::string value;
@@ -173,6 +173,11 @@ class Cache {
 
   /// Removes an entry from both structures, in the only safe order. O(1).
   void remove(Index::iterator it);
+
+  /// Looks up a key that is present and not expired. An expired entry found on
+  /// the way is reclaimed. Returns index_.end() for both "absent" and "expired",
+  /// which is exactly the distinction a reader cannot observe. O(1) average.
+  Index::iterator find_live(const std::string& key);
 
   /// Removes the least recently used entry from both structures. O(1).
   void evict_oldest();

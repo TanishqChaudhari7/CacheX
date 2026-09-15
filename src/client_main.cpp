@@ -34,7 +34,7 @@ void print_banner(const std::string& host, std::uint16_t port) {
   std::cout << "CacheX client " << cachex::version_string() << " connected to "
             << host << ":" << port << "\n"
             << "commands: SET key value [ttl_seconds] | GET key | DELETE key\n"
-            << "          EXISTS key | TTL key | PING | QUIT\n"
+            << "          EXISTS key | TTL key | SAVE | LOAD | PING | QUIT\n"
             << "Ctrl-D or QUIT to exit\n\n";
 }
 
@@ -51,13 +51,9 @@ int main(int argc, char** argv) {
   if (argc >= 2) {
     host = argv[1];
   }
-  if (argc >= 3) {
-    try {
-      port = static_cast<std::uint16_t>(std::stoi(argv[2]));
-    } catch (const std::exception&) {
-      std::cerr << "cachex-client: invalid port '" << argv[2] << "'\n";
-      return 2;
-    }
+  if (argc >= 3 && (!cachex::parse_port(argv[2], port) || port == 0)) {
+    std::cerr << "cachex-client: invalid port '" << argv[2] << "'\n";
+    return 2;
   }
 
   std::string error;

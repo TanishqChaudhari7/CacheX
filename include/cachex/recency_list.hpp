@@ -13,11 +13,11 @@ namespace cachex {
 /// The key is stored here *as well as* in the Cache's hash map. That duplication
 /// is deliberate: eviction walks from the list to the map (take the oldest node,
 /// then remove its key from the index), and without the key in the node there
-/// would be no way to find the map entry to erase. See ARCHITECTURE.md §12.
+/// would be no way to find the map entry to erase. See ARCHITECTURE.md §5.
 struct Entry {
   /// steady_clock, not system_clock: it is monotonic, so an NTP correction or a
   /// manual clock change cannot resurrect an expired key or mass-expire live
-  /// ones. See ARCHITECTURE.md §6.2.
+  /// ones. See ARCHITECTURE.md §7.
   using Clock = std::chrono::steady_clock;
 
   std::string key;
@@ -47,8 +47,8 @@ class RecencyList {
 
   /// Inserts a new entry at the front (most recently used). O(1).
   /// The returned iterator stays valid until that entry is erased.
-  /// Takes a whole Entry so that adding fields to it does not change this
-  /// signature -- which is what happened when TTL arrived.
+  /// Takes a whole Entry so that adding a field to Entry does not change this
+  /// signature.
   Iterator insert_newest(Entry entry);
 
   /// Moves an existing entry to the front. O(1), no allocation, and `it` remains

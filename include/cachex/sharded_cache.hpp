@@ -31,7 +31,7 @@ namespace cachex {
 /// lock to contend on and no lock ordering to get wrong.
 ///
 /// **The cost is that LRU becomes per-shard rather than global.** See
-/// ARCHITECTURE §9.4: a hot key in a crowded shard can be evicted while a colder
+/// ARCHITECTURE.md §11: a hot key in a crowded shard can be evicted while a colder
 /// key in a quiet shard survives.
 class ShardedCache {
  public:
@@ -86,7 +86,7 @@ class ShardedCache {
   /// shard but not a single point-in-time view of the whole cache: shard 0 is
   /// read slightly before shard N-1. Locking all shards at once would give a
   /// true snapshot and would reintroduce exactly the global stall sharding
-  /// exists to remove. See ARCHITECTURE §9.4 and §10.4.
+  /// exists to remove. See ARCHITECTURE.md §11 and §12.
   std::vector<EntrySnapshot> export_entries() const;
 
   // --- shard introspection (diagnostics and tests) --------------------------

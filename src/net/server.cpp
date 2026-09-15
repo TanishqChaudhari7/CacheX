@@ -8,11 +8,11 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <system_error>
 #include <utility>
 
-#include "cachex/protocol.hpp"
-
 #include "cachex/connection.hpp"
+#include "cachex/protocol.hpp"
 
 namespace cachex {
 namespace {
@@ -152,21 +152,32 @@ void Server::spawn_worker(Socket client) {
               << std::flush;
   }
 
-  std::thread worker([this, socket = std::move(client), finished, id]() mutable {
-    Connection connection(std::move(socket), cache_, persistence_);
-    connection.serve();
+  std::thread worker;
+  try {
+    worker = std::thread([this, socket = std::move(client), finished, id]() mutable {
+      Connection connection(std::move(socket), cache_, persistence_);
+      connection.serve();
 
-    if (options_.verbose) {
-      std::cout << "[cachex] client #" << id << " disconnected after "
-                << connection.commands_handled() << " command(s)\n"
-                << std::flush;
-    }
+      if (options_.verbose) {
+        std::cout << "[cachex] client #" << id << " disconnected after "
+                  << connection.commands_handled() << " command(s)\n"
+                  << std::flush;
+      }
+      active_connections_.fetch_sub(1);
+
+      // Set last: once this is true the accept loop may join and destroy this
+      // Worker, so nothing after it may touch the thread's own state.
+      finished->store(true);
+    });
+  } catch (const std::system_error& e) {
+    // The OS refused to create a thread (resource limits). Without this the
+    // exception would escape run() and take down every other connection, and
+    // the active count would stay incremented forever. The socket was moved
+    // into the discarded lambda, so this connection is already closed.
     active_connections_.fetch_sub(1);
-
-    // Set last: once this is true the accept loop may join and destroy this
-    // Worker, so nothing after it may touch the thread's own state.
-    finished->store(true);
-  });
+    std::cerr << "[cachex] could not start a worker thread: " << e.what() << "\n";
+    return;
+  }
 
   const std::lock_guard<std::mutex> lock(workers_mutex_);
   workers_.push_back(Worker{std::move(worker), std::move(finished)});
@@ -193,9 +204,9 @@ void Server::join_all_workers() {
     const std::lock_guard<std::mutex> lock(workers_mutex_);
     remaining.swap(workers_);
   }
-  // Joined outside the lock: a worker that finishes here would otherwise try to
-  // take workers_mutex_ through reap, and blocking a join on a lock the joining
-  // thread already holds is how deadlocks get written.
+  // Joined outside the lock. Workers never take workers_mutex_, but a join can
+  // block for as long as a client stays connected, and holding a lock across an
+  // unbounded wait is how a later change turns into a deadlock.
   for (Worker& worker : remaining) {
     if (worker.thread.joinable()) {
       worker.thread.join();

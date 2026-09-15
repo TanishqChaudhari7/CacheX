@@ -47,14 +47,6 @@ std::uint64_t g_sink = 0;
 
 // --- helpers ---------------------------------------------------------------
 
-/// Zero-padded to a constant 16 bytes: variable-length keys would make hashing
-/// and comparison cost drift over a run. 16 bytes also fits libc++/libstdc++
-/// small-string storage, so key handling itself costs no allocation.
-std::string make_key(const char* prefix, std::size_t i) {
-  const std::string digits = std::to_string(i);
-  return prefix + std::string(12 - digits.size(), '0') + digits;
-}
-
 template <typename F>
 Nanos time_it(F&& f) {
   const auto start = Clock::now();
@@ -78,7 +70,7 @@ Timings run_core_phases(const std::vector<std::string>& keys,
                         const std::vector<std::size_t>& access_order,
                         const std::string& value) {
   Timings t;
-  cachex::Cache cache;  // unbounded, so these stay comparable to the Stage 2 baseline
+  cachex::Cache cache;  // unbounded, so capacity and eviction play no part
 
   t.set_insert = time_it([&] {
     for (const std::string& key : keys) {
@@ -349,10 +341,10 @@ int main() {
   keys.reserve(std::max(kOperations, kKeySpace));
   absent_keys.reserve(kOperations);
   for (std::size_t i = 0; i < std::max(kOperations, kKeySpace); ++i) {
-    keys.push_back(make_key("key:", i));
+    keys.push_back(bench::pad_key(i, "key:"));
   }
   for (std::size_t i = 0; i < kOperations; ++i) {
-    absent_keys.push_back(make_key("nil:", i));
+    absent_keys.push_back(bench::pad_key(i, "nil:"));
   }
 
   // Reads follow a shuffled order rather than insertion order. Walking keys in
@@ -365,7 +357,7 @@ int main() {
   const std::string value(kValueBytes, 'v');
 
   // =========================================================================
-  std::cout << "\n\n1. CORE OPERATIONS (unbounded cache -- Stage 2 baseline)\n"
+  std::cout << "\n\n1. CORE OPERATIONS (unbounded cache)\n"
             << "   " << kOperations << " ops per phase, median of " << kRepeats
             << " after a discarded warm-up\n\n";
 

@@ -28,7 +28,7 @@ if(CMAKE_EXPORT_COMPILE_COMMANDS AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_
   file(CREATE_LINK
     "${CMAKE_BINARY_DIR}/compile_commands.json"
     "${CMAKE_SOURCE_DIR}/compile_commands.json"
-    SYMBOLIC)
+    COPY_ON_ERROR SYMBOLIC)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <charconv>
 #include <cstring>
 
 namespace cachex {
@@ -38,12 +39,6 @@ void Socket::close() noexcept {
     ::close(fd_);
     fd_ = kInvalid;
   }
-}
-
-int Socket::release() noexcept {
-  const int fd = fd_;
-  fd_ = kInvalid;
-  return fd;
 }
 
 bool send_all(int fd, std::string_view data) {
@@ -120,6 +115,17 @@ Socket connect_to(const std::string& host, std::uint16_t port,
     error = "no usable address";
   }
   return Socket{};
+}
+
+bool parse_port(std::string_view text, std::uint16_t& port) {
+  unsigned long value = 0;
+  const char* const end = text.data() + text.size();
+  const std::from_chars_result parsed = std::from_chars(text.data(), end, value);
+  if (text.empty() || parsed.ec != std::errc() || parsed.ptr != end || value > 65535) {
+    return false;
+  }
+  port = static_cast<std::uint16_t>(value);
+  return true;
 }
 
 }  // namespace cachex

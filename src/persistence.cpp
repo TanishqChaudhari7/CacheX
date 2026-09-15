@@ -1,6 +1,9 @@
 #include "cachex/persistence.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -54,6 +57,23 @@ struct Record {
   long long ttl_ms = kNoExpiry;
 };
 
+/// The smallest possible record, "0 0 0\n\n", is 7 bytes. Used to reject an
+/// entry count that could not possibly fit in the file before trusting it.
+constexpr long long kMinRecordBytes = 7;
+
+/// A temp-file name no other save can be using at the same moment.
+///
+/// Every save writes to its own temp file and renames it over the snapshot.
+/// With one shared temp name, two concurrent saves -- two clients sending SAVE,
+/// or SAVE racing the periodic saver -- would truncate and write the same file
+/// at once and could rename an interleaved, corrupt result into place. The pid
+/// separates processes; the counter separates saves within one.
+std::string unique_temp_path(const std::string& path) {
+  static std::atomic<unsigned long> counter{0};
+  return path + ".tmp." + std::to_string(::getpid()) + "." +
+         std::to_string(counter.fetch_add(1));
+}
+
 bool read_exact(std::istream& in, std::string& out, std::size_t count) {
   out.resize(count);
   if (count == 0) {
@@ -78,7 +98,7 @@ PersistenceManager::SaveResult PersistenceManager::save(
   // is held, so a slow disk cannot stall the request path.
   const std::vector<EntrySnapshot> entries = cache.export_entries();
 
-  const std::string temp_path = path_ + ".tmp";
+  const std::string temp_path = unique_temp_path(path_);
   {
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -133,6 +153,17 @@ PersistenceManager::LoadResult PersistenceManager::load(ShardedCache& cache) con
     return result;
   }
 
+  // The file size bounds every count and length read below. They come from
+  // disk and cannot be trusted: a corrupt count of 10^18 passed to reserve(), or
+  // a corrupt length passed to resize(), would throw bad_alloc and take the
+  // server down instead of reporting a bad file.
+  in.seekg(0, std::ios::end);
+  const long long file_bytes = static_cast<long long>(in.tellg());
+  in.seekg(0, std::ios::beg);
+  const auto bytes_left = [&in, file_bytes]() {
+    return file_bytes - static_cast<long long>(in.tellg());
+  };
+
   std::string magic;
   int version = 0;
   long long saved_at_ms = 0;
@@ -158,6 +189,10 @@ PersistenceManager::LoadResult PersistenceManager::load(ShardedCache& cache) con
     return result;
   }
   in.get();  // the newline after the count
+  if (count > bytes_left() / kMinRecordBytes) {
+    result.error = "entry count " + std::to_string(count) + " exceeds what the file can hold";
+    return result;
+  }
 
   // Everything is parsed and validated before a single entry is applied, so a
   // truncated or corrupt file leaves the cache exactly as it was.
@@ -178,6 +213,10 @@ PersistenceManager::LoadResult PersistenceManager::load(ShardedCache& cache) con
     }
     if (in.get() != '\n') {
       result.error = "malformed entry header at record " + std::to_string(i);
+      return result;
+    }
+    if (key_len > bytes_left() || value_len > bytes_left() - key_len) {
+      result.error = "length exceeds file size at record " + std::to_string(i);
       return result;
     }
 
@@ -202,7 +241,7 @@ PersistenceManager::LoadResult PersistenceManager::load(ShardedCache& cache) con
   // recently used first, so replaying backwards makes the most recently used
   // key the last one set -- restoring the same recency order *within each
   // shard*. Across shards the order is not preserved, and cannot be: LRU is
-  // per-shard (§9.4), so there is no global order to restore.
+  // per-shard (ARCHITECTURE.md §11), so there is no global order to restore.
   for (auto it = records.rbegin(); it != records.rend(); ++it) {
     if (it->ttl_ms == kNoExpiry) {
       cache.set(std::move(it->key), std::move(it->value));

@@ -10,28 +10,16 @@
 #include "cachex/sharded_cache.hpp"
 #include "cachex/sync_cache.hpp"
 #include "test_framework.hpp"
+#include "test_support.hpp"
+
+using cachex::testing::run_parallel;
+using cachex::testing::ServerFixture;
+using cachex::testing::TestClient;
 
 #include <sys/socket.h>
 #include <sys/time.h>
 
 namespace {
-
-/// Runs `worker(thread_index)` on `count` threads and waits for all of them.
-///
-/// The threads are started in a loop and joined in a second loop, so they
-/// genuinely overlap. Starting and joining one at a time would serialise them
-/// and quietly test nothing.
-template <typename F>
-void run_parallel(int count, F worker) {
-  std::vector<std::thread> threads;
-  threads.reserve(static_cast<std::size_t>(count));
-  for (int i = 0; i < count; ++i) {
-    threads.emplace_back([&worker, i] { worker(i); });
-  }
-  for (std::thread& thread : threads) {
-    thread.join();
-  }
-}
 
 constexpr int kThreads = 8;
 constexpr int kOpsPerThread = 2000;
@@ -226,84 +214,11 @@ CACHEX_TEST(read_modify_write_is_not_atomic_even_though_each_call_is) {
 
 // --- concurrency over TCP --------------------------------------------------
 
-namespace {
-
-class ConcurrentServerFixture {
- public:
-  ConcurrentServerFixture() : server_(cache_, options()) {
-    std::string error;
-    started_ = server_.start(error);
-    if (started_) {
-      thread_ = std::thread([this] { server_.run(); });
-    }
-  }
-  ~ConcurrentServerFixture() {
-    server_.stop();
-    if (thread_.joinable()) {
-      thread_.join();
-    }
-  }
-  bool started() const { return started_; }
-  std::uint16_t port() const { return server_.bound_port(); }
-  cachex::ShardedCache& cache() { return cache_; }
-  const cachex::Server& server() const { return server_; }
-
- private:
-  static cachex::Server::Options options() {
-    cachex::Server::Options opts;
-    opts.port = 0;
-    opts.verbose = false;
-    return opts;
-  }
-  cachex::ShardedCache cache_{1};
-  cachex::Server server_;
-  std::thread thread_;
-  bool started_ = false;
-};
-
-/// Minimal client used by the concurrent tests.
-class Client {
- public:
-  explicit Client(std::uint16_t port) {
-    std::string error;
-    socket_ = cachex::connect_to("127.0.0.1", port, error);
-    if (socket_.valid()) {
-      timeval timeout{};
-      timeout.tv_sec = 10;
-      ::setsockopt(socket_.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                   sizeof(timeout));
-    }
-  }
-  bool connected() const { return socket_.valid(); }
-  std::string request(const std::string& command) {
-    if (!cachex::send_all(socket_.get(), command + "\n")) {
-      return "<send failed>";
-    }
-    while (true) {
-      if (std::optional<std::string> line = replies_.next_line()) {
-        return *line;
-      }
-      char chunk[4096];
-      const ssize_t received = ::recv(socket_.get(), chunk, sizeof(chunk), 0);
-      if (received <= 0) {
-        return "<no reply>";
-      }
-      replies_.append(chunk, static_cast<std::size_t>(received));
-    }
-  }
-
- private:
-  cachex::Socket socket_;
-  cachex::LineBuffer replies_;
-};
-
-}  // namespace
 
 // The point of this stage: several clients connected at the same time, each on
-// its own server thread. Under the Stage 5 server the later clients would have
-// sat in the backlog until the first one disconnected.
+// its own server thread. 
 CACHEX_TEST(many_clients_are_served_at_the_same_time) {
-  ConcurrentServerFixture fixture;
+  ServerFixture fixture;
   CHECK(fixture.started());
 
   constexpr int kClients = 8;
@@ -311,7 +226,7 @@ CACHEX_TEST(many_clients_are_served_at_the_same_time) {
   std::atomic<int> failures{0};
 
   run_parallel(kClients, [&fixture, &failures](int client_id) {
-    Client client(fixture.port());
+    TestClient client(fixture.port());
     if (!client.connected()) {
       failures.fetch_add(1);
       return;
@@ -336,10 +251,10 @@ CACHEX_TEST(many_clients_are_served_at_the_same_time) {
 }
 
 CACHEX_TEST(clients_see_each_others_writes_through_the_shared_cache) {
-  ConcurrentServerFixture fixture;
+  ServerFixture fixture;
 
-  Client writer(fixture.port());
-  Client reader(fixture.port());
+  TestClient writer(fixture.port());
+  TestClient reader(fixture.port());
   CHECK(writer.connected());
   CHECK(reader.connected());
 
@@ -349,11 +264,11 @@ CACHEX_TEST(clients_see_each_others_writes_through_the_shared_cache) {
 }
 
 CACHEX_TEST(all_worker_threads_are_joined_when_the_server_stops) {
-  ConcurrentServerFixture fixture;
+  ServerFixture fixture;
   {
-    std::vector<std::unique_ptr<Client>> clients;
+    std::vector<std::unique_ptr<TestClient>> clients;
     for (int i = 0; i < 4; ++i) {
-      clients.push_back(std::make_unique<Client>(fixture.port()));
+      clients.push_back(std::make_unique<TestClient>(fixture.port()));
       CHECK_EQ(clients.back()->request("PING"), "+PONG");
     }
     CHECK(fixture.server().active_connections() > 0u);

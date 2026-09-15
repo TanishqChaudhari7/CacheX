@@ -35,9 +35,6 @@ class Socket {
 
   void close() noexcept;
 
-  /// Gives up ownership without closing.
-  int release() noexcept;
-
  private:
   int fd_ = kInvalid;
 };
@@ -57,5 +54,12 @@ void set_no_sigpipe(int fd);
 /// Resolves host/port and connects. Returns an invalid Socket on failure, with
 /// `error` describing why.
 Socket connect_to(const std::string& host, std::uint16_t port, std::string& error);
+
+/// Parses a TCP port strictly: digits only, 0-65535, nothing trailing.
+///
+/// The obvious static_cast<uint16_t>(std::stoi(text)) is wrong three ways: it
+/// accepts "123abc", it silently wraps 70000 to 4464, and -1 becomes 65535 -- so
+/// a typo starts the server on a port nobody asked for.
+bool parse_port(std::string_view text, std::uint16_t& port);
 
 }  // namespace cachex
