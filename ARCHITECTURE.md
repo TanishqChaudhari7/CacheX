@@ -45,7 +45,6 @@ Building that cache means answering four questions:
 - **Many clients arrive at once.** How do concurrent readers and writers share
   one data structure without corrupting it or serialising everything?
 
-CacheX answers each one in a codebase small enough to explain line by line.
 
 ---
 
