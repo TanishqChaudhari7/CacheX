@@ -6,20 +6,20 @@ compiler       : AppleClang 21.0.0.21000101
 key size       : 16 bytes (fits small-string storage)
 value size     : 64 bytes (heap allocated)
 seed           : 42
-clock          : std::chrono::steady_clock, measured overhead 24.3 ns/read, tick 41.0 ns
+clock          : std::chrono::steady_clock, measured overhead 35.3 ns/read, tick 41.0 ns
 
 
-1. CORE OPERATIONS (unbounded cache -- Stage 2 baseline)
+1. CORE OPERATIONS (unbounded cache)
    200000 ops per phase, median of 5 after a discarded warm-up
 
 phase                ops  total (ms)       ops/sec    avg (ns)
 --------------------------------------------------------------
-SET insert        200000       30.68       6518816       153.4
-SET update        200000      140.15       1427000       700.8
-GET hit           200000       94.77       2110334       473.9
-GET miss          200000        9.34      21415952        46.7
-CONTAINS          200000       20.32       9844336       101.6
-ERASE             200000       72.48       2759326       362.4
+SET insert        200000       28.90       6921044       144.5
+SET update        200000      155.88       1283064       779.4
+GET hit           200000      111.40       1795288       557.0
+GET miss          200000       10.62      18837048        53.1
+CONTAINS          200000       21.93       9121418       109.6
+ERASE             200000       87.73       2279817       438.6
 
 
 2. COST OF LRU (identical request sequence, interleaved)
@@ -27,13 +27,13 @@ ERASE             200000       72.48       2759326       362.4
 
 configuration                            ops/sec    avg (ns)    evictions
 -------------------------------------------------------------------------
-unbounded (no LRU)                       8912739       112.2            0
-bounded, capacity = key space            8477016       118.0            0
-bounded, capacity = 10% of keys          6818366       146.7        80196
+unbounded (no LRU)                       9118212       109.7            0
+bounded, capacity = key space            9082858       110.1            0
+bounded, capacity = 10% of keys          6896899       145.0        80196
 
   Rows 1 and 2 do identical work; row 2 additionally performs the
   capacity check on every insert. Paired per-repeat comparison over 15 repeats:
-    median +0.6%   middle half -0.2% to +6.7%   full range -16.9% to +21.0%
+    median -0.3%   middle half -0.8% to +0.6%   full range -20.7% to +23.1%
   The interval straddles zero, so the overhead is below this
   harness's noise floor -- the expected result for one predictable
   branch per insert. That is NOT a claim that LRU is free; it means
@@ -47,16 +47,16 @@ bounded, capacity = 10% of keys          6818366       146.7        80196
    measured at steady state: one full warm-up pass is discarded
 
   requests   : 200000  (179882 GET, 20118 SET)
-  throughput : 6831204 ops/sec (146.4 ns/op per application request)
+  throughput : 6917673 ops/sec (144.6 ns/op per application request)
   hit rate   : 84.21%  (151475 hits, 28407 misses)
   fills      : 28407 (cache-aside populations on miss)
   evictions  : 31495,  entries resident: 40000
 
   latency (ns)    samples       mean       p50       p95       p99         max
   ----------------------------------------------------------------------------
-  GET              179882       96.0      84.0     167.0     208.0     14500.0
-  SET               48525      215.0     209.0     334.0     416.0     14541.0
-  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+  GET              179882       94.8      84.0     125.0     167.0     13958.0
+  SET               48525      209.0     208.0     333.0     375.0     17167.0
+  (each sample includes ~35.3 ns of clock-read overhead, and is quantised to the
    clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
 
 
@@ -65,16 +65,16 @@ bounded, capacity = 10% of keys          6818366       146.7        80196
    no hot set to retain, so this is the worst case for LRU
 
   requests   : 200000  (40085 GET, 159915 SET)
-  throughput : 4536047 ops/sec (220.5 ns/op per application request)
+  throughput : 4557396 ops/sec (219.4 ns/op per application request)
   hit rate   : 4.92%  (1971 hits, 38114 misses)
   fills      : 38114 (cache-aside populations on miss)
   evictions  : 189939,  entries resident: 5000
 
   latency (ns)    samples       mean       p50       p95       p99         max
   ----------------------------------------------------------------------------
-  GET               40085       74.4      83.0     166.0     250.0     11959.0
-  SET              198029      222.7     208.0     333.0     459.0     16666.0
-  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+  GET               40085       62.9      42.0     125.0     125.0     11792.0
+  SET              198029      212.4     208.0     292.0     375.0     14458.0
+  (each sample includes ~35.3 ns of clock-read overhead, and is quantised to the
    clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
 
 
@@ -82,12 +82,12 @@ bounded, capacity = 10% of keys          6818366       146.7        80196
 
 capacity                  hit rate     evictions       ops/sec
 --------------------------------------------------------------
-1%    (1000 entries)         3.32%        193372       5336049
-5%    (5000 entries)        15.92%        168125       4030700
-10%   (10000 entries)       30.92%        138149       4002482
-20%   (20000 entries)       57.78%         84385       4935377
-40%   (40000 entries)       84.21%         31495       6866157
-100%  (100000 entries)     100.00%             0      10704394
+1%    (1000 entries)         3.32%        193372       5321561
+5%    (5000 entries)        15.92%        168125       4097021
+10%   (10000 entries)       30.92%        138149       4106664
+20%   (20000 entries)       57.78%         84385       4907996
+40%   (40000 entries)       84.21%         31495       6878180
+100%  (100000 entries)     100.00%             0      10941019
 
 
 6. COST OF TTL CHECKS
@@ -96,12 +96,12 @@ capacity                  hit rate     evictions       ops/sec
 
 case                                 ops/sec    avg (ns)     reclaimed
 ----------------------------------------------------------------------
-a) GET hit, no TTL                   2600332       384.6             0
-b) GET hit, TTL set                  2808289       356.1             0
-c) GET, all entries expired          1696004       589.6        100000
+a) GET hit, no TTL                   5058457       197.7             0
+b) GET hit, TTL set                  4574208       218.6             0
+c) GET, all entries expired          2159423       463.1        100000
 
   Cost of the check itself -- (b) against (a), paired per repeat:
-    median +0.2%   middle half -15.1% to +20.8%   full range -37.7% to +78.6%
+    median +10.6%   middle half +8.9% to +12.0%   full range +4.2% to +33.5%
   Case (c) is a different path, not merely a slower one: those
   gets return nothing and delete an entry, so it is not
   comparable to (a) or (b). It is reported to show what a sea of
@@ -109,10 +109,10 @@ c) GET, all entries expired          1696004       589.6        100000
 
   latency (ns)    samples       mean       p50       p95       p99         max
   ----------------------------------------------------------------------------
-  no TTL           100000      497.1     416.0     917.0    3666.0     73958.0
-  TTL set          100000      340.2     291.0     667.0    1000.0     14792.0
-  expired          100000      523.1     416.0    1041.0    3625.0     16417.0
-  (each sample includes ~24.3 ns of clock-read overhead, and is quantised to the
+  no TTL           100000      427.4     375.0     917.0    1334.0     19500.0
+  TTL set          100000      545.6     458.0    1209.0    1625.0     27000.0
+  expired          100000      521.8     375.0    1292.0    1833.0     24250.0
+  (each sample includes ~35.3 ns of clock-read overhead, and is quantised to the
    clock's 41.0 ns tick -- so these are tick counts, not fine-grained times)
 
 checksum: 536627648  (printed only so the optimiser cannot discard the work)
